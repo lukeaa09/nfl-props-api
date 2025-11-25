@@ -5,30 +5,29 @@ import nflreadpy as nfl
 import pandas as pd
 import polars as pl
 from functools import lru_cache
+from typing import Any
 
 SEASON = 2025
 
 app = FastAPI(
     title="NFL Props API",
     description="Simple API that exposes nflverse weekly player stats",
-    version="2.0.0",
+    version="2.1.0",
 )
 
 # Allow your frontend to talk to this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can lock this down later
+    allow_origins=["*"],  # lock down later if you want
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# 🔴 CATCH *ALL* UNHANDLED ERRORS AND RETURN JSON INSTEAD OF HTML 500
+# 🔴 GLOBAL ERROR HANDLER: never return HTML 500, always JSON
 @app.exception_handler(Exception)
 async def all_exception_handler(request: Request, exc: Exception):
-    # This makes sure the browser never just shows an HTML "Internal Server Error".
-    # Instead you'll get JSON like: { "ok": false, "error": "..." }
     return JSONResponse(
         status_code=500,
         content={
@@ -36,6 +35,25 @@ async def all_exception_handler(request: Request, exc: Exception):
             "error": repr(exc),
         },
     )
+
+
+def clean_nans(value: Any) -> Any:
+    """
+    Recursively replace NaN/NaT with None so JSON encoding doesn't break.
+    """
+    if isinstance(value, float):
+        # NaN check: NaN != NaN
+        if value != value:
+            return None
+        return value
+    if isinstance(value, dict):
+        return {k: clean_nans(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [clean_nans(v) for v in value]
+    if isinstance(value, pd.Timestamp):
+        # convert timestamps to ISO string
+        return value.isoformat()
+    return value
 
 
 @lru_cache(maxsize=1)
@@ -82,10 +100,11 @@ def debug_columns():
     """
     try:
         df = load_weekly_stats()
+        sample = df.head(3).to_dict(orient="records")
         return {
             "ok": True,
             "columns": list(df.columns),
-            "sample": df.head(3).to_dict(orient="records"),
+            "sample": clean_nans(sample),
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -147,7 +166,6 @@ def list_players(q: str | None = None):
 def player_detail(player_id: str, week: int | None = None):
     """
     Very defensive version of player detail:
-    - Never raises an exception (global handler will catch it if it does)
     - Returns:
         ok: True/False
         player: { id, name, team, position }
@@ -187,14 +205,14 @@ def player_detail(player_id: str, week: int | None = None):
     else:
         selected_week = week if week is not None else None
 
-    # build overview
+    # build overview (single week)
     if selected_week is not None and "week" in pdf.columns:
         row_df = pdf[pdf["week"] == selected_week]
         overview = row_df.iloc[0].to_dict() if not row_df.empty else None
     else:
         overview = None
 
-    # weekly log = all rows for this player
+    # weekly log = all rows for this player (raw)
     if "week" in pdf.columns:
         pdf_sorted = pdf.sort_values("week")
     else:
@@ -214,13 +232,17 @@ def player_detail(player_id: str, week: int | None = None):
         "position": position,
     }
 
+    # 🔥 Clean NaNs before returning so JSON encoding doesn't break
+    overview_clean = clean_nans(overview)
+    weekly_log_clean = clean_nans(weekly_log)
+
     return {
         "ok": True,
         "player": identity,
         "selectedWeek": selected_week,
         "weeksWithData": weeks_with_data,
-        "overview": overview,
-        "weeklyLog": weekly_log,
+        "overview": overview_clean,
+        "weeklyLog": weekly_log_clean,
     }
 
 
