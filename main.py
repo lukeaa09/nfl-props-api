@@ -1,5 +1,6 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import nflreadpy as nfl
 import pandas as pd
 import polars as pl
@@ -10,9 +11,10 @@ SEASON = 2025
 app = FastAPI(
     title="NFL Props API",
     description="Simple API that exposes nflverse weekly player stats",
-    version="1.0.0",
+    version="2.0.0",
 )
 
+# Allow your frontend to talk to this API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # you can lock this down later
@@ -20,6 +22,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# 🔴 CATCH *ALL* UNHANDLED ERRORS AND RETURN JSON INSTEAD OF HTML 500
+@app.exception_handler(Exception)
+async def all_exception_handler(request: Request, exc: Exception):
+    # This makes sure the browser never just shows an HTML "Internal Server Error".
+    # Instead you'll get JSON like: { "ok": false, "error": "..." }
+    return JSONResponse(
+        status_code=500,
+        content={
+            "ok": False,
+            "error": repr(exc),
+        },
+    )
 
 
 @lru_cache(maxsize=1)
@@ -41,7 +57,6 @@ def load_weekly_stats() -> pd.DataFrame:
     elif isinstance(pl_df, pd.DataFrame):
         df = pl_df
     else:
-        # Fallback, just in case
         df = pd.DataFrame(pl_df)
 
     return df
@@ -82,138 +97,131 @@ def list_players(q: str | None = None):
     List players (id, name, team, position) for offensive positions.
     Optional q: case-insensitive substring match on name.
     """
-    try:
-        df = load_weekly_stats()
+    df = load_weekly_stats()
 
-        cols = set(df.columns)
-        required = {"player_id", "player_display_name", "team", "position"}
-        missing = sorted(required - cols)
-        if missing:
-            return {
-                "ok": False,
-                "error": "Missing required columns in weekly stats",
-                "missing": missing,
-                "columns": sorted(cols),
-            }
-
-        # Filter to offensive skill positions only
-        df_use = df[df["position"].isin(["QB", "RB", "WR", "TE"])]
-
-        base = (
-            df_use[["player_id", "player_display_name", "team", "position"]]
-            .drop_duplicates()
-            .sort_values("player_display_name")
-        )
-
-        if q:
-            q_lower = q.lower()
-            mask = base["player_display_name"].str.lower().str.contains(
-                q_lower, na=False
-            )
-            base = base[mask]
-
-        players = [
-            {
-                "id": row.player_id,
-                "name": row.player_display_name,
-                "team": row.team,
-                "position": row.position,
-            }
-            for row in base.itertuples()
-        ]
-
-        return {
-            "ok": True,
-            "count": len(players),
-            "players": players,
-        }
-
-    except Exception as e:
+    cols = set(df.columns)
+    required = {"player_id", "player_display_name", "team", "position"}
+    missing = sorted(required - cols)
+    if missing:
         return {
             "ok": False,
-            "error": f"list_players_failed: {e}",
+            "error": "Missing required columns in weekly stats",
+            "missing": missing,
+            "columns": sorted(cols),
         }
+
+    # Filter to offensive positions
+    df_use = df[df["position"].isin(["QB", "RB", "WR", "TE"])]
+
+    base = (
+        df_use[["player_id", "player_display_name", "team", "position"]]
+        .drop_duplicates()
+        .sort_values("player_display_name")
+    )
+
+    if q:
+        q_lower = q.lower()
+        mask = base["player_display_name"].str.lower().str.contains(
+            q_lower, na=False
+        )
+        base = base[mask]
+
+    players = [
+        {
+            "id": row.player_id,
+            "name": row.player_display_name,
+            "team": row.team,
+            "position": row.position,
+        }
+        for row in base.itertuples()
+    ]
+
+    return {
+        "ok": True,
+        "count": len(players),
+        "players": players,
+    }
 
 
 @app.get("/player/{player_id}")
 def player_detail(player_id: str, week: int | None = None):
     """
-    Detailed stats for one player.
-
-    - If `week` is omitted, use the latest week with data.
+    Very defensive version of player detail:
+    - Never raises an exception (global handler will catch it if it does)
     - Returns:
-        ok: bool
+        ok: True/False
         player: { id, name, team, position }
-        selectedWeek: int
+        selectedWeek: int or None
         weeksWithData: [int, ...]
-        overview: dict for the selected week (or null if no row)
+        overview: dict for the selected week, or None
         weeklyLog: list of dicts for all weeks for that player
     """
-    try:
-        df = load_weekly_stats()
+    df = load_weekly_stats()
 
-        # Basic column sanity
-        cols = set(df.columns)
-        if "player_id" not in cols or "week" not in cols:
-            return {
-                "ok": False,
-                "error": "Missing 'player_id' or 'week' column",
-                "columns": sorted(cols),
-            }
+    if "player_id" not in df.columns:
+        return {
+            "ok": False,
+            "error": "No 'player_id' column in data",
+            "columns": list(df.columns),
+        }
 
-        # All rows for this player
-        pdf = df[df["player_id"] == player_id].copy()
-        if pdf.empty:
-            return {"ok": False, "error": "Player not found"}
+    pdf = df[df["player_id"] == player_id].copy()
+    if pdf.empty:
+        return {
+            "ok": False,
+            "error": "Player not found",
+        }
 
-        # Weeks with data
+    # figure out weeks with data
+    if "week" in pdf.columns:
         weeks_with_data = sorted(int(w) for w in pdf["week"].unique())
+    else:
+        weeks_with_data = []
 
-        # Decide which week to use
+    # decide selected week
+    if weeks_with_data:
         if week is None:
             selected_week = max(weeks_with_data)
         else:
             selected_week = int(week)
+    else:
+        selected_week = week if week is not None else None
 
+    # build overview
+    if selected_week is not None and "week" in pdf.columns:
         row_df = pdf[pdf["week"] == selected_week]
-        if row_df.empty:
-            overview = None
-        else:
-            # Convert whole row to a plain dict of stats
-            overview = row_df.iloc[0].to_dict()
+        overview = row_df.iloc[0].to_dict() if not row_df.empty else None
+    else:
+        overview = None
 
-        # Full weekly log (all weeks for this player)
+    # weekly log = all rows for this player
+    if "week" in pdf.columns:
         pdf_sorted = pdf.sort_values("week")
-        weekly_log = pdf_sorted.to_dict(orient="records")
+    else:
+        pdf_sorted = pdf
+    weekly_log = pdf_sorted.to_dict(orient="records")
 
-        # Player identity (use any row)
-        first = pdf_sorted.iloc[-1]
-        name = first.get("player_display_name") or first.get("player_name")
-        team = first.get("team")
-        position = first.get("position")
+    # basic identity
+    first = pdf_sorted.iloc[-1]
+    name = first.get("player_display_name") or first.get("player_name")
+    team = first.get("team")
+    position = first.get("position")
 
-        identity = {
-            "id": player_id,
-            "name": name,
-            "team": team,
-            "position": position,
-        }
+    identity = {
+        "id": player_id,
+        "name": name,
+        "team": team,
+        "position": position,
+    }
 
-        return {
-            "ok": True,
-            "player": identity,
-            "selectedWeek": selected_week,
-            "weeksWithData": weeks_with_data,
-            "overview": overview,
-            "weeklyLog": weekly_log,
-        }
-
-    except Exception as e:
-        # Catch EVERYTHING so the client never sees a 500 HTML page
-        return {
-            "ok": False,
-            "error": f"player_detail_failed: {e}",
-        }
+    return {
+        "ok": True,
+        "player": identity,
+        "selectedWeek": selected_week,
+        "weeksWithData": weeks_with_data,
+        "overview": overview,
+        "weeklyLog": weekly_log,
+    }
 
 
 if __name__ == "__main__":
