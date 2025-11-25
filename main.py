@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import nflreadpy as nfl
 import pandas as pd
@@ -9,14 +9,13 @@ SEASON = 2025
 
 app = FastAPI(
     title="NFL Props API",
-    description="Simple API that exposes nflverse weekly 2025 player stats",
-    version="0.1.3",
+    description="Simple API that exposes nflverse weekly player stats",
+    version="1.0.0",
 )
 
-# Allow your frontend to talk to this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # later you can restrict this to your domain
+    allow_origins=["*"],  # you can lock this down later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -26,33 +25,30 @@ app.add_middleware(
 @lru_cache(maxsize=1)
 def load_weekly_stats() -> pd.DataFrame:
     """
-    Load nflverse weekly player-level stats for the current season.
+    Load nflverse weekly player stats for one season.
 
     nflreadpy returns a Polars DataFrame by default.
-    We will:
-      1) Filter positions using Polars syntax
-      2) Convert the result to pandas
+    We always convert to pandas BEFORE doing any filtering.
     """
-    # Polars DataFrame
     pl_df = nfl.load_player_stats(
         seasons=[SEASON],
         summary_level="week",
     )
 
-    # Filter to offensive skill positions (QB/RB/WR/TE) using Polars
-    pl_df = pl_df.filter(pl.col("position").is_in(["QB", "RB", "WR", "TE"]))
-
-    # Convert to pandas DataFrame for the rest of the code
-    df = pl_df.to_pandas()
+    # Polars -> pandas
+    if isinstance(pl_df, pl.DataFrame):
+        df = pl_df.to_pandas()
+    elif isinstance(pl_df, pd.DataFrame):
+        df = pl_df
+    else:
+        # Fallback, just in case
+        df = pd.DataFrame(pl_df)
 
     return df
 
 
 @app.get("/health")
 def health():
-    """
-    Simple health check to make sure stats loaded correctly.
-    """
     try:
         df = load_weekly_stats()
         return {
@@ -64,49 +60,51 @@ def health():
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/debug_columns")
+def debug_columns():
+    """
+    Just for debugging: shows columns + 3 sample rows.
+    """
+    try:
+        df = load_weekly_stats()
+        return {
+            "ok": True,
+            "columns": list(df.columns),
+            "sample": df.head(3).to_dict(orient="records"),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/players")
 def list_players(q: str | None = None):
     """
-    Return a unique list of players (id, name, team, position).
-    Optional q = case-insensitive substring match on name.
+    List players (id, name, team, position) for offensive positions.
+    Optional q: case-insensitive substring match on name.
     """
     try:
         df = load_weekly_stats()
 
-        # Figure out which columns actually exist and map them
-        cols_available = set(df.columns)
-
-        id_col = "player_id" if "player_id" in cols_available else None
-        name_col = (
-            "player_display_name"
-            if "player_display_name" in cols_available
-            else ("player_name" if "player_name" in cols_available else None)
-        )
-        team_col = (
-            "recent_team"
-            if "recent_team" in cols_available
-            else ("team" if "team" in cols_available else None)
-        )
-        pos_col = "position" if "position" in cols_available else None
-
-        if not (id_col and name_col and team_col and pos_col):
-            # If we somehow don't have the right columns, bail with a clear error
-            raise RuntimeError(
-                f"Missing required columns. Have: {sorted(cols_available)}"
-            )
-
-        # Build a slim DataFrame and rename columns to a standard schema
-        base = df[[id_col, name_col, team_col, pos_col]].drop_duplicates()
-        base = base.rename(
-            columns={
-                id_col: "player_id",
-                name_col: "player_display_name",
-                team_col: "recent_team",
-                pos_col: "position",
+        cols = set(df.columns)
+        required = {"player_id", "player_display_name", "team", "position"}
+        missing = sorted(required - cols)
+        if missing:
+            return {
+                "ok": False,
+                "error": "Missing required columns in weekly stats",
+                "missing": missing,
+                "columns": sorted(cols),
             }
+
+        # Filter to offensive skill positions only
+        df_use = df[df["position"].isin(["QB", "RB", "WR", "TE"])]
+
+        base = (
+            df_use[["player_id", "player_display_name", "team", "position"]]
+            .drop_duplicates()
+            .sort_values("player_display_name")
         )
 
-        # Optional search
         if q:
             q_lower = q.lower()
             mask = base["player_display_name"].str.lower().str.contains(
@@ -118,105 +116,106 @@ def list_players(q: str | None = None):
             {
                 "id": row.player_id,
                 "name": row.player_display_name,
-                "team": row.recent_team,
+                "team": row.team,
                 "position": row.position,
             }
             for row in base.itertuples()
         ]
 
-        return {"players": players}
+        return {
+            "ok": True,
+            "count": len(players),
+            "players": players,
+        }
 
     except Exception as e:
-        # Wrap any error so the client gets details instead of a blank 500 page
-        raise HTTPException(status_code=500, detail=f"list_players_failed: {e}")
+        return {
+            "ok": False,
+            "error": f"list_players_failed: {e}",
+        }
 
 
 @app.get("/player/{player_id}")
 def player_detail(player_id: str, week: int | None = None):
     """
-    Return stats for a single player.
+    Detailed stats for one player.
 
-    - week: specific week (if None, return latest week with data)
-    Also includes a small weekly log (recent games).
+    - If `week` is omitted, use the latest week with data.
+    - Returns:
+        ok: bool
+        player: { id, name, team, position }
+        selectedWeek: int
+        weeksWithData: [int, ...]
+        overview: dict for the selected week (or null if no row)
+        weeklyLog: list of dicts for all weeks for that player
     """
     try:
         df = load_weekly_stats()
 
-        pdf = df[df["player_id"] == player_id].copy()
-        if pdf.empty:
-            raise HTTPException(status_code=404, detail="Player not found")
-
-        # Basic identity info
-        first = pdf.iloc[0]
-        identity = {
-            "id": first["player_id"],
-            "name": first.get("player_display_name", first.get("player_name")),
-            "team": first.get("recent_team", first.get("team")),
-            "position": first["position"],
-        }
-
-        # Determine which week to show
-        if week is None:
-            latest_week = int(pdf["week"].max())
-        else:
-            latest_week = int(week)
-
-        # Single week row
-        row = pdf[pdf["week"] == latest_week]
-        if row.empty:
-            overview = None
-        else:
-            r = row.iloc[0]
-            overview = {
-                "week": int(r["week"]),
-                "season_type": r.get("season_type"),
-                "team": r.get("recent_team", r.get("team")),
-                "opponent": r.get("opponent_team", None),
-                "passing_yards": r.get("passing_yards", None),
-                "passing_tds": r.get("passing_tds", None),
-                "interceptions": r.get("interceptions", None),
-                "rushing_yards": r.get("rushing_yards", None),
-                "rushing_tds": r.get("rushing_tds", None),
-                "receptions": r.get("receptions", None),
-                "receiving_yards": r.get("receiving_yards", None),
-                "receiving_tds": r.get("receiving_tds", None),
+        # Basic column sanity
+        cols = set(df.columns)
+        if "player_id" not in cols or "week" not in cols:
+            return {
+                "ok": False,
+                "error": "Missing 'player_id' or 'week' column",
+                "columns": sorted(cols),
             }
 
-        # Recent weekly log (last 5 weeks with data)
-        pdf_sorted = pdf.sort_values("week", ascending=False).head(5)
-        weekly_log = []
-        for r in pdf_sorted.itertuples():
-            weekly_log.append(
-                {
-                    "week": int(r.week),
-                    "team": getattr(r, "recent_team", getattr(r, "team", None)),
-                    "opponent": getattr(r, "opponent_team", None),
-                    "passing_yards": getattr(r, "passing_yards", None),
-                    "passing_tds": getattr(r, "passing_tds", None),
-                    "interceptions": getattr(r, "interceptions", None),
-                    "rushing_yards": getattr(r, "rushing_yards", None),
-                    "rushing_tds": getattr(r, "rushing_tds", None),
-                    "receptions": getattr(r, "receptions", None),
-                    "receiving_yards": getattr(r, "receiving_yards", None),
-                    "receiving_tds": getattr(r, "receiving_tds", None),
-                }
-            )
+        # All rows for this player
+        pdf = df[df["player_id"] == player_id].copy()
+        if pdf.empty:
+            return {"ok": False, "error": "Player not found"}
+
+        # Weeks with data
+        weeks_with_data = sorted(int(w) for w in pdf["week"].unique())
+
+        # Decide which week to use
+        if week is None:
+            selected_week = max(weeks_with_data)
+        else:
+            selected_week = int(week)
+
+        row_df = pdf[pdf["week"] == selected_week]
+        if row_df.empty:
+            overview = None
+        else:
+            # Convert whole row to a plain dict of stats
+            overview = row_df.iloc[0].to_dict()
+
+        # Full weekly log (all weeks for this player)
+        pdf_sorted = pdf.sort_values("week")
+        weekly_log = pdf_sorted.to_dict(orient="records")
+
+        # Player identity (use any row)
+        first = pdf_sorted.iloc[-1]
+        name = first.get("player_display_name") or first.get("player_name")
+        team = first.get("team")
+        position = first.get("position")
+
+        identity = {
+            "id": player_id,
+            "name": name,
+            "team": team,
+            "position": position,
+        }
 
         return {
+            "ok": True,
             "player": identity,
-            "selectedWeek": latest_week,
+            "selectedWeek": selected_week,
+            "weeksWithData": weeks_with_data,
             "overview": overview,
             "weeklyLog": weekly_log,
         }
 
-    except HTTPException:
-        # re-raise HTTPExceptions as-is (404, etc)
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"player_detail_failed: {e}")
+        # Catch EVERYTHING so the client never sees a 500 HTML page
+        return {
+            "ok": False,
+            "error": f"player_detail_failed: {e}",
+        }
 
 
-# Local dev entrypoint (not used on Render, but nice to have)
 if __name__ == "__main__":
     import uvicorn
 
