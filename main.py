@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import nflreadpy as nfl
 import pandas as pd
+import polars as pl
 from functools import lru_cache
 
 SEASON = 2025
@@ -9,7 +10,7 @@ SEASON = 2025
 app = FastAPI(
     title="NFL Props API",
     description="Simple API that exposes nflverse weekly 2025 player stats",
-    version="0.1.1",
+    version="0.1.2",
 )
 
 # Allow your frontend to talk to this API
@@ -27,21 +28,22 @@ def load_weekly_stats() -> pd.DataFrame:
     """
     Load nflverse weekly player-level stats for the current season.
 
-    nflreadpy returns a Polars DataFrame by default, so we convert it to pandas
-    before doing pandas-style filtering like .isin().
+    nflreadpy returns a Polars DataFrame by default.
+    We will:
+      1) Filter positions using Polars syntax (no .isin)
+      2) Convert the result to pandas
     """
-    # This is a Polars DataFrame
+    # Polars DataFrame
     pl_df = nfl.load_player_stats(
         seasons=[SEASON],
         summary_level="week",
     )
 
-    # Convert to pandas
-    df = pl_df.to_pandas()
+    # Filter to offensive skill positions (QB/RB/WR/TE) using Polars
+    pl_df = pl_df.filter(pl.col("position").is_in(["QB", "RB", "WR", "TE"]))
 
-    # Filter to offensive skill positions only (QB/RB/WR/TE)
-    if "position" in df.columns:
-        df = df[df["position"].isin(["QB", "RB", "WR", "TE"])].copy()
+    # Convert to pandas DataFrame for the rest of the code
+    df = pl_df.to_pandas()
 
     return df
 
