@@ -4,7 +4,6 @@ from fastapi.responses import JSONResponse
 import nflreadpy as nfl
 import pandas as pd
 import polars as pl
-from functools import lru_cache
 from typing import Any
 
 SEASON = 2025
@@ -12,7 +11,7 @@ SEASON = 2025
 app = FastAPI(
     title="NFL Props API",
     description="Simple API that exposes nflverse weekly player stats",
-    version="2.1.0",
+    version="2.2.0",
 )
 
 # Allow your frontend to talk to this API
@@ -42,8 +41,7 @@ def clean_nans(value: Any) -> Any:
     Recursively replace NaN/NaT with None so JSON encoding doesn't break.
     """
     if isinstance(value, float):
-        # NaN check: NaN != NaN
-        if value != value:
+        if value != value:  # NaN check
             return None
         return value
     if isinstance(value, dict):
@@ -51,18 +49,16 @@ def clean_nans(value: Any) -> Any:
     if isinstance(value, list):
         return [clean_nans(v) for v in value]
     if isinstance(value, pd.Timestamp):
-        # convert timestamps to ISO string
         return value.isoformat()
     return value
 
 
-@lru_cache(maxsize=1)
 def load_weekly_stats() -> pd.DataFrame:
     """
     Load nflverse weekly player stats for one season.
 
-    nflreadpy returns a Polars DataFrame by default.
-    We always convert to pandas BEFORE doing any filtering.
+    By removing the cache, this will always pull the latest data
+    as nflverse updates (new weeks, updated stats, etc.).
     """
     pl_df = nfl.load_player_stats(
         seasons=[SEASON],
@@ -78,6 +74,7 @@ def load_weekly_stats() -> pd.DataFrame:
         df = pd.DataFrame(pl_df)
 
     return df
+    
 
 
 @app.get("/health")
