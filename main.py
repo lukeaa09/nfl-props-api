@@ -9,12 +9,13 @@ SEASON = 2025
 app = FastAPI(
     title="NFL Props API",
     description="Simple API that exposes nflverse weekly 2025 player stats",
-    version="0.1.0",
+    version="0.1.1",
 )
 
+# Allow your frontend to talk to this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # later you can restrict this to your domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -23,16 +24,33 @@ app.add_middleware(
 
 @lru_cache(maxsize=1)
 def load_weekly_stats() -> pd.DataFrame:
-    df = nfl.load_player_stats(
+    """
+    Load nflverse weekly player-level stats for the current season.
+
+    nflreadpy returns a Polars DataFrame by default, so we convert it to pandas
+    before doing pandas-style filtering like .isin().
+    """
+    # This is a Polars DataFrame
+    pl_df = nfl.load_player_stats(
         seasons=[SEASON],
         summary_level="week",
     )
-    df = df[df["position"].isin(["QB", "RB", "WR", "TE"])].copy()
+
+    # Convert to pandas
+    df = pl_df.to_pandas()
+
+    # Filter to offensive skill positions only (QB/RB/WR/TE)
+    if "position" in df.columns:
+        df = df[df["position"].isin(["QB", "RB", "WR", "TE"])].copy()
+
     return df
 
 
 @app.get("/health")
 def health():
+    """
+    Simple health check to make sure stats loaded correctly.
+    """
     try:
         df = load_weekly_stats()
         return {
@@ -46,9 +64,15 @@ def health():
 
 @app.get("/players")
 def list_players(q: str | None = None):
+    """
+    Return a unique list of players (id, name, team, position).
+    Optional q = case-insensitive substring match on name.
+    """
     df = load_weekly_stats()
 
-    base = df[["player_id", "player_display_name", "recent_team", "position"]].drop_duplicates()
+    # Only keep the columns we care about and deduplicate players
+    cols = ["player_id", "player_display_name", "recent_team", "position"]
+    base = df[cols].drop_duplicates()
 
     if q:
         q_lower = q.lower()
@@ -70,12 +94,19 @@ def list_players(q: str | None = None):
 
 @app.get("/player/{player_id}")
 def player_detail(player_id: str, week: int | None = None):
+    """
+    Return stats for a single player.
+
+    - week: specific week (if None, return latest week with data)
+    Also includes a small weekly log (recent games).
+    """
     df = load_weekly_stats()
 
     pdf = df[df["player_id"] == player_id].copy()
     if pdf.empty:
         raise HTTPException(status_code=404, detail="Player not found")
 
+    # Basic identity info
     first = pdf.iloc[0]
     identity = {
         "id": first["player_id"],
@@ -84,11 +115,13 @@ def player_detail(player_id: str, week: int | None = None):
         "position": first["position"],
     }
 
+    # Determine which week to show
     if week is None:
         latest_week = int(pdf["week"].max())
     else:
         latest_week = int(week)
 
+    # Single week row
     row = pdf[pdf["week"] == latest_week]
     if row.empty:
         overview = None
@@ -109,6 +142,7 @@ def player_detail(player_id: str, week: int | None = None):
             "receiving_tds": r.get("receiving_tds", None),
         }
 
+    # Recent weekly log (last 5 weeks with data)
     pdf_sorted = pdf.sort_values("week", ascending=False).head(5)
     weekly_log = []
     for r in pdf_sorted.itertuples():
@@ -136,6 +170,7 @@ def player_detail(player_id: str, week: int | None = None):
     }
 
 
+# Local dev entrypoint (not used on Render, but nice to have)
 if __name__ == "__main__":
     import uvicorn
 
