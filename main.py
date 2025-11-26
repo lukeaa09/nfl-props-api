@@ -54,6 +54,29 @@ def clean_nans(value: Any) -> Any:
 
 
 def load_weekly_stats() -> pd.DataFrame:
+    def load_schedule() -> pd.DataFrame | None:
+    """
+    Load NFL schedule for this season.
+
+    Used to figure out:
+      - who each team plays in a given week
+      - whether they're home or away
+      - whether it's a night game (rough approximation)
+    """
+    try:
+        pl_df = nfl.load_schedules(seasons=[SEASON])
+    except Exception:
+        return None
+
+    if isinstance(pl_df, pl.DataFrame):
+        df = pl_df.to_pandas()
+    elif isinstance(pl_df, pd.DataFrame):
+        df = pl_df
+    else:
+        df = pd.DataFrame(pl_df)
+
+    return df
+
     """
     Load nflverse weekly player stats for one season.
 
