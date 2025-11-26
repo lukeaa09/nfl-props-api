@@ -1,608 +1,239 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import nflreadpy as nfl
+from fastapi.routing import APIRouter
 import pandas as pd
-import polars as pl
-from typing import Any
+import nfl_data_py as nfl
+import numpy as np
+import requests
+import os
 
+# -----------------------------------------------------------------------------
+# CONFIG
+# -----------------------------------------------------------------------------
 SEASON = 2025
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY")  # MUST BE SET IN RENDER ENV
+ODDS_API_REGION = "us"
+ODDS_API_SPORT = "americanfootball_nfl"
 
-app = FastAPI(
-    title="NFL Props API",
-    description="Simple API that exposes nflverse weekly player stats and basic AI picks",
-    version="3.0.0",
-)
+# -----------------------------------------------------------------------------
+# APP SETUP
+# -----------------------------------------------------------------------------
+app = FastAPI()
 
-# Allow your frontend to talk to this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can lock this down later to your domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Routers
+router_players = APIRouter()
+router_stats = APIRouter()
+router_odds = APIRouter()
+router_ai = APIRouter()
 
-# -----------------------
-# Global error handler
-# -----------------------
-@app.exception_handler(Exception)
-async def all_exception_handler(request: Request, exc: Exception):
-    return JSONResponse(
-        status_code=500,
-        content={
-            "ok": False,
-            "error": repr(exc),
-        },
-    )
-
-
-# -----------------------
-# Utility: clean NaNs
-# -----------------------
-def clean_nans(value: Any) -> Any:
-    """
-    Recursively replace NaN/NaT with None so JSON encoding doesn't break.
-    """
-    if isinstance(value, float):
-        # NaN check: NaN != NaN
-        if value != value:
-            return None
-        return value
-    if isinstance(value, dict):
-        return {k: clean_nans(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [clean_nans(v) for v in value]
-    if isinstance(value, pd.Timestamp):
-        return value.isoformat()
-    return value
-
-
-# -----------------------
-# Load weekly stats
-# -----------------------
-def load_weekly_stats() -> pd.DataFrame:
-    """
-    Load nflverse weekly player stats for the given season.
-
-    No caching: this always pulls the latest data, so new weeks
-    show up automatically when nflverse updates.
-    """
-    pl_df = nfl.load_player_stats(
-        seasons=[SEASON],
-        summary_level="week",
-    )
-
-    # Polars -> pandas
-    if isinstance(pl_df, pl.DataFrame):
-        df = pl_df.to_pandas()
-    elif isinstance(pl_df, pd.DataFrame):
-        df = pl_df
-    else:
-        df = pd.DataFrame(pl_df)
-
-    return df
-
-
-# -----------------------
-# Load schedule (for home/away, opponent, primetime)
-# -----------------------
+# -----------------------------------------------------------------------------
+# LOAD SCHEDULE
+# -----------------------------------------------------------------------------
 def load_schedule() -> pd.DataFrame | None:
-    """
-    Load NFL schedule for this season.
-
-    Used to figure out:
-      - who each team plays in a given week
-      - whether they're home or away
-      - whether it's (roughly) a night game
-    """
     try:
-        pl_df = nfl.load_schedules(seasons=[SEASON])
+        df = nfl.load_schedules(seasons=[SEASON])
+        return df
     except Exception:
         return None
 
-    if isinstance(pl_df, pl.DataFrame):
-        df = pl_df.to_pandas()
-    elif isinstance(pl_df, pd.DataFrame):
-        df = pl_df
-    else:
-        df = pd.DataFrame(pl_df)
+SCHEDULE = load_schedule()
 
-    return df
+def get_match_info(team: str, week: int):
+    if SCHEDULE is None:
+        return {"opponent": None, "home": None, "night": None}
 
-
-# -----------------------
-# Basic endpoints
-# -----------------------
-@app.get("/health")
-def health():
-    try:
-        df = load_weekly_stats()
-        return {
-            "ok": True,
-            "season": SEASON,
-            "rows": int(len(df)),
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-@app.get("/debug_columns")
-def debug_columns():
-    """
-    Just for debugging: shows columns + a few sample rows.
-    """
-    try:
-        df = load_weekly_stats()
-        sample = df.head(3).to_dict(orient="records")
-        return {
-            "ok": True,
-            "columns": list(df.columns),
-            "sample": clean_nans(sample),
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-# -----------------------
-# /players: list/search
-# -----------------------
-@app.get("/players")
-def list_players(q: str | None = None):
-    """
-    List players (id, name, team, position) for offensive positions.
-    Optional q: case-insensitive substring match on name.
-    """
-    df = load_weekly_stats()
-
-    cols = set(df.columns)
-    required = {"player_id", "player_display_name", "team", "position"}
-    missing = sorted(required - cols)
-    if missing:
-        return {
-            "ok": False,
-            "error": "Missing required columns in weekly stats",
-            "missing": missing,
-            "columns": sorted(cols),
-        }
-
-    # Filter to offensive positions
-    df_use = df[df["position"].isin(["QB", "RB", "WR", "TE"])]
-
-    base = (
-        df_use[["player_id", "player_display_name", "team", "position"]]
-        .drop_duplicates()
-        .sort_values("player_display_name")
-    )
-
-    if q:
-        q_lower = q.lower()
-        mask = base["player_display_name"].str.lower().str.contains(
-            q_lower, na=False
-        )
-        base = base[mask]
-
-    players = [
-        {
-            "id": row.player_id,
-            "name": row.player_display_name,
-            "team": row.team,
-            "position": row.position,
-        }
-        for row in base.itertuples()
+    row = SCHEDULE[
+        (SCHEDULE["team"] == team) &
+        (SCHEDULE["week"] == week)
     ]
 
-    return {
-        "ok": True,
-        "count": len(players),
-        "players": players,
-    }
+    if row.empty:
+        return {"opponent": None, "home": None, "night": None}
 
+    row = row.iloc[0]
 
-# -----------------------
-# /player/{id}: details
-# -----------------------
-@app.get("/player/{player_id}")
-def player_detail(player_id: str, week: int | None = None):
-    """
-    Return weekly log + overview for a single player.
-    - weeksWithData: which weeks they have stats
-    - selectedWeek: which week is currently selected
-    - overview: stats row for that week (or latest if week=None)
-    - weeklyLog: all weekly rows for that player
-    """
-    df = load_weekly_stats()
+    opponent = row.get("opponent", None)
+    home = row.get("home", None)
+    game_type = str(row.get("game_type", "")).lower()
+    night = ("night" in game_type) or ("prime" in game_type)
 
-    if "player_id" not in df.columns:
-        return {
-            "ok": False,
-            "error": "No 'player_id' column in data",
-            "columns": list(df.columns),
-        }
+    return {"opponent": opponent, "home": home, "night": night}
 
-    pdf = df[df["player_id"] == player_id].copy()
-    if pdf.empty:
-        return {
-            "ok": False,
-            "error": "Player not found",
-        }
+# -----------------------------------------------------------------------------
+# LOAD WEEKLY PLAYER STATS
+# -----------------------------------------------------------------------------
+def load_weekly_stats():
+    try:
+        df = nfl.import_weekly_data([SEASON])
+        df.replace([np.nan, np.inf, -np.inf], None, inplace=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
 
-    # Weeks with data
-    if "week" in pdf.columns:
-        weeks_with_data = sorted(int(w) for w in pdf["week"].unique())
-    else:
-        weeks_with_data = []
+WEEKLY = load_weekly_stats()
 
-    # Decide selected week
-    if weeks_with_data:
-        if week is None:
-            selected_week = max(weeks_with_data)
-        else:
-            selected_week = int(week)
-    else:
-        selected_week = week if week is not None else None
-
-    # Overview row for selectedWeek
-    if selected_week is not None and "week" in pdf.columns:
-        row_df = pdf[pdf["week"] == selected_week]
-        overview = row_df.iloc[0].to_dict() if not row_df.empty else None
-    else:
-        overview = None
-
-    # Weekly log sorted by week
-    if "week" in pdf.columns:
-        pdf_sorted = pdf.sort_values("week")
-    else:
-        pdf_sorted = pdf
-
-    weekly_log = pdf_sorted.to_dict(orient="records")
-
-    # Identity fields
-    first = pdf_sorted.iloc[-1]
-    name = first.get("player_display_name") or first.get("player_name")
-    team = first.get("team")
-    position = first.get("position")
-
-    identity = {
-        "id": player_id,
-        "name": name,
-        "team": team,
-        "position": position,
-    }
-
-    overview_clean = clean_nans(overview)
-    weekly_log_clean = clean_nans(weekly_log)
-
-    return {
-        "ok": True,
-        "player": identity,
-        "selectedWeek": selected_week,
-        "weeksWithData": weeks_with_data,
-        "overview": overview_clean,
-        "weeklyLog": weekly_log_clean,
-    }
-
-
-# -----------------------
-# AI picks (matchup-aware)
-# -----------------------
-VALID_STATS = {
-    "passing_yards": "passing_yards",
-    "rushing_yards": "rushing_yards",
-    "receiving_yards": "receiving_yards",
-    "receptions": "receptions",
-    "fantasy_points_ppr": "fantasy_points_ppr",
-}
-
-
-@app.get("/ai_picks")
-def ai_picks(
-    week: int | None = None,
-    position: str | None = None,
-    stat: str = "passing_yards",
-    limit: int = 20,
-):
-    """
-    Matchup-aware 'AI picks' endpoint.
-
-    For a target week:
-      - Looks at all games BEFORE that week
-      - Projects the stat for each offensive player
-      - Adjusts based on:
-          * opponent defense vs that stat (rank & softness)
-          * home vs away
-          * rough primetime flag
-      - Returns projection + confidence + matchup context
-
-    This is for analytics / education only, not betting advice.
-    """
-
-    df = load_weekly_stats()
-
-    if stat not in VALID_STATS:
-        return {
-            "ok": False,
-            "error": f"Unsupported stat '{stat}'. Valid options: {sorted(VALID_STATS.keys())}",
-        }
-
-    stat_col = VALID_STATS[stat]
-
-    if "week" not in df.columns:
-        return {
-            "ok": False,
-            "error": "No 'week' column in data",
-            "columns": list(df.columns),
-        }
-
-    max_week = int(df["week"].max())
-
-    # Target week: default = next week after last completed week
-    if week is None:
-        target_week = max_week + 1
-    else:
-        target_week = int(week)
-
-    # Historical games only (no peeking into target week)
-    hist = df[df["week"] < target_week].copy()
-
-    # Positions to consider
-    if position is not None:
-        hist = hist[hist["position"] == position]
-    else:
-        hist = hist[hist["position"].isin(["QB", "RB", "WR", "TE"])]
-
-    if hist.empty:
-        return {
-            "ok": False,
-            "error": f"No historical data found before week {target_week} for the given filters.",
-        }
-
-    if stat_col not in hist.columns:
-        return {
-            "ok": False,
-            "error": f"Stat column '{stat_col}' not found in data.",
-            "columns": list(hist.columns),
-        }
-
-    # ---------------------------
-    # Defense strength vs stat
-    # ---------------------------
-    # For each defense (opponent_team), how much of this stat do they allow per game?
-    def_allowed = (
-        hist.groupby("opponent_team")[stat_col]
-        .mean()
-        .dropna()
-        .rename("def_allowed_avg")
+# -----------------------------------------------------------------------------
+# /players/search?q=
+# -----------------------------------------------------------------------------
+@router_players.get("/players/search")
+def search_players(q: str):
+    df = WEEKLY.copy()
+    players = (
+        df[["player_id", "player_display_name", "team", "position"]]
+        .drop_duplicates()
     )
 
-    def_df = def_allowed.reset_index().rename(columns={"opponent_team": "def_team"})
+    mask = players["player_display_name"].str.contains(q, case=False, na=False)
+    results = players[mask].head(20)
 
-    if not def_df.empty:
-        # Rank defenses: 1 = toughest (lowest allowed), N = softest (highest allowed)
-        def_df["defense_rank_vs_stat"] = def_df["def_allowed_avg"].rank(
-            method="min", ascending=True
-        ).astype(int)
-        max_rank = int(def_df["defense_rank_vs_stat"].max())
-        # Softness score: 0 = toughest, 1 = softest
-        def_df["defense_softness"] = (
-            (def_df["defense_rank_vs_stat"] - 1) / max(1, (max_rank - 1))
-        )
-        defense_map = def_df.set_index("def_team")[
-            ["def_allowed_avg", "defense_rank_vs_stat", "defense_softness"]
+    return {
+        "players": [
+            {
+                "id": row.player_id,
+                "name": row.player_display_name,
+                "team": row.team,
+                "position": row.position
+            }
+            for _, row in results.iterrows()
         ]
-    else:
-        defense_map = None
+    }
 
-    # ---------------------------
-    # Schedule: home/away + primetime for target week
-    # ---------------------------
-    schedule_df = load_schedule()
-    schedule_map = None
-    if schedule_df is not None and {"season", "week", "home_team", "away_team"}.issubset(
-        schedule_df.columns
-    ):
-        sched = schedule_df[
-            (schedule_df["season"] == SEASON) & (schedule_df["week"] == target_week)
-        ].copy()
+# -----------------------------------------------------------------------------
+# /players/{player_id}/week/{week}
+# -----------------------------------------------------------------------------
+@router_players.get("/players/{player_id}/week/{week}")
+def get_player_week(player_id: str, week: int):
+    df = WEEKLY.copy()
+    rows = df[(df["player_id"] == player_id)]
 
-        records = []
-        for _, row in sched.iterrows():
-            home = row["home_team"]
-            away = row["away_team"]
-            gameday = row.get("gameday")
-            gametime = row.get("gametime")
-            weekday = row.get("weekday")
+    if rows.empty:
+        raise HTTPException(status_code=404, detail="Player not found")
 
-            # Very rough primetime flag: MNF/TNF/SNF or time >= 20:00
-            is_night = False
-            try:
-                if isinstance(gametime, str) and len(gametime) >= 2:
-                    hour = int(gametime.split(":")[0])
-                    if hour >= 20:
-                        is_night = True
-                if isinstance(weekday, str) and weekday.upper() in {
-                    "MONDAY",
-                    "THURSDAY",
-                    "SUNDAY",
-                }:
-                    # many spotlight games are on these days
-                    is_night = True or is_night
-            except Exception:
-                pass
+    # Weeks available
+    wks = sorted([int(x) for x in rows["week"].dropna().unique()])
 
-            # Home team view
-            records.append(
-                {
-                    "team": home,
-                    "opponent": away,
-                    "is_home": True,
-                    "is_prime_time": bool(is_night),
-                    "gameday": gameday,
-                    "gametime": gametime,
-                    "weekday": weekday,
-                }
-            )
-            # Away team view
-            records.append(
-                {
-                    "team": away,
-                    "opponent": home,
-                    "is_home": False,
-                    "is_prime_time": bool(is_night),
-                    "gameday": gameday,
-                    "gametime": gametime,
-                    "weekday": weekday,
-                }
-            )
+    # Find the weekly row
+    selected = rows[rows["week"] == week]
+    selected_row = selected.iloc[0] if not selected.empty else None
 
-        if records:
-            sched_map_df = pd.DataFrame.from_records(records)
-            schedule_map = sched_map_df.set_index("team")
+    # Basic player info
+    player_info = {
+        "id": player_id,
+        "name": rows.iloc[0].player_display_name,
+        "team": rows.iloc[0].team,
+        "position": rows.iloc[0].position
+    }
 
-    picks: list[dict] = []
+    # Schedule info
+    match_info = get_match_info(player_info["team"], week)
 
-    grouped = hist.groupby("player_id")
-
-    for player_id, g in grouped:
-        stat_series = g[stat_col].dropna()
-        games_played = int((~stat_series.isna()).sum())
-        if games_played < 3:
-            continue
-
-        avg = float(stat_series.mean())
-        std = float(stat_series.std(ddof=0)) if games_played > 1 else 0.0
-        last3_avg = float(stat_series.tail(3).mean())
-
-        # Base projection from averages
-        projection = 0.6 * avg + 0.4 * last3_avg
-
-        # Consistency: 0–1, higher = more consistent
-        epsilon = 1e-6
-        variability = std / (avg + epsilon) if avg > 0 else 1.0
-        consistency = 1.0 / (1.0 + variability)
-
-        # Base confidence from sample size (0–1)
-        base_conf = min(1.0, games_played / 10.0)
-
-        # Identity fields
-        last_row = g.iloc[-1]
-        name = last_row.get("player_display_name") or last_row.get("player_name")
-        team = last_row.get("team")
-        pos = last_row.get("position")
-
-        # Matchup context for target week
-        opponent = None
-        is_home = None
-        is_prime = None
-        gameday = None
-        gametime = None
-        weekday = None
-
-        if schedule_map is not None and team in schedule_map.index:
-            match = schedule_map.loc[team]
-            opponent = match.get("opponent")
-            is_home = bool(match.get("is_home"))
-            is_prime = bool(match.get("is_prime_time"))
-            gameday = match.get("gameday")
-            gametime = match.get("gametime")
-            weekday = match.get("weekday")
-
-        # Defense vs this stat
-        def_rank = None
-        def_allowed_avg = None
-        defense_softness = None
-
-        if opponent and defense_map is not None and opponent in defense_map.index:
-            drow = defense_map.loc[opponent]
-            def_allowed_avg = float(drow["def_allowed_avg"])
-            def_rank = int(drow["defense_rank_vs_stat"])
-            defense_softness = float(drow["defense_softness"])
-
-        # Apply context multipliers
-        context_mult_conf = 1.0
-        context_mult_proj = 1.0
-
-        # Defense softness: 0 = toughest, 1 = softest
-        if defense_softness is not None:
-            # Boost a little vs softer defenses, small penalty vs tough
-            context_mult_conf *= 0.9 + 0.2 * defense_softness  # ~0.9–1.1
-            context_mult_proj *= 0.95 + 0.1 * defense_softness  # ~0.95–1.05
-
-        # Home field advantage
-        if is_home is True:
-            context_mult_conf *= 1.05
-            context_mult_proj *= 1.03
-        elif is_home is False:
-            context_mult_conf *= 0.97
-            context_mult_proj *= 0.98
-
-        # Primetime – tiny bump
-        if is_prime is True:
-            context_mult_conf *= 1.02
-
-        # Final projection / confidence
-        projection_adj = projection * context_mult_proj
-        confidence_raw = 100 * base_conf * consistency * context_mult_conf
-        confidence = max(1, min(100, int(round(confidence_raw))))
-
-        rating = max(1, min(5, confidence // 20))
-
-        pick = {
-            "player_id": player_id,
-            "name": name,
-            "team": team,
-            "position": pos,
-            "stat": stat,
-            "target_week": target_week,
-            "projection": projection_adj,
-            "games_sampled": games_played,
-            "avg": avg,
-            "last3_avg": last3_avg,
-            "std": std,
-            "consistency": consistency,
-            "confidence": confidence,  # 0–100
-            "rating": rating,          # 1–5
-
-            # Matchup info
-            "opponent": opponent,
-            "defense_allowed_avg": def_allowed_avg,
-            "defense_rank_vs_stat": def_rank,
-            "is_home": is_home,
-            "is_prime_time": is_prime,
-            "gameday": gameday,
-            "gametime": gametime,
-            "weekday": weekday,
-        }
-
-        picks.append(pick)
-
-    if not picks:
-        return {
-            "ok": False,
-            "error": "No players had enough history for this stat.",
-        }
-
-    # Score: projection * (confidence scaled) – simple ranking
-    def pick_score(p: dict) -> float:
-        return float(p["projection"]) * (p["confidence"] / 100.0)
-
-    picks_sorted = sorted(picks, key=pick_score, reverse=True)
-    picks_top = picks_sorted[: max(1, int(limit))]
-
-    picks_clean = clean_nans(picks_top)
+    # Weekly log
+    weekly_records = []
+    for _, r in rows.sort_values("week").iterrows():
+        weekly_records.append(r.to_dict())
 
     return {
         "ok": True,
-        "week": target_week,
-        "stat": stat,
-        "position": position,
-        "count": len(picks_clean),
-        "picks": picks_clean,
+        "player": player_info,
+        "selectedWeek": week,
+        "matchup": match_info,
+        "weeksWithData": wks,
+        "overview": selected_row.to_dict() if selected_row is not None else None,
+        "weeklyLog": weekly_records
     }
 
+# -----------------------------------------------------------------------------
+# /player-props/week/{week} (Odds API)
+# -----------------------------------------------------------------------------
+@router_odds.get("/player-props/week/{week}")
+def odds_for_week(week: int):
+    if not ODDS_API_KEY:
+        raise HTTPException(status_code=500, detail="Missing Odds API key")
 
-if __name__ == "__main__":
-    import uvicorn
+    url = (
+        f"https://api.the-odds-api.com/v4/sports/{ODDS_API_SPORT}/odds/"
+        f"?apiKey={ODDS_API_KEY}&regions={ODDS_API_REGION}&markets=player_pass_yds,player_rec_yds,player_rush_yds"
+    )
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    try:
+        r = requests.get(url)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    props_out = []
+
+    for game in data:
+        commence = game.get("commence_time")
+        for book in game.get("bookmakers", []):
+            for market in book.get("markets", []):
+                market_key = market.get("key")
+
+                for outcome in market.get("outcomes", []):
+                    player = outcome.get("name")
+                    line = outcome.get("point")
+
+                    props_out.append({
+                        "player": player,
+                        "market": market_key,
+                        "line": line,
+                        "sportsbook": book.get("title"),
+                        "game_time": commence
+                    })
+
+    return {"ok": True, "props": props_out}
+
+# -----------------------------------------------------------------------------
+# Simple AI projection: /ai/picks/{week}
+# -----------------------------------------------------------------------------
+@router_ai.get("/ai/picks/{week}")
+def ai_pick_week(week: int):
+    df = WEEKLY[WEEKLY["week"] == week]
+
+    if df.empty:
+        return {"ok": False, "error": "No data for this week"}
+
+    picks = []
+
+    for _, r in df.iterrows():
+        score = (
+            (r.get("passing_epa") or 0) +
+            (r.get("rushing_epa") or 0) +
+            (r.get("receiving_epa") or 0)
+        )
+
+        picks.append({
+            "player": r.player_display_name,
+            "team": r.team,
+            "position": r.position,
+            "score": round(score, 2)
+        })
+
+    picks = sorted(picks, key=lambda x: x["score"], reverse=True)
+
+    return {"ok": True, "week": week, "picks": picks[:20]}
+
+# -----------------------------------------------------------------------------
+# REGISTER ROUTERS
+# -----------------------------------------------------------------------------
+app.include_router(router_players)
+app.include_router(router_stats)
+app.include_router(router_odds)
+app.include_router(router_ai)
+
+# -----------------------------------------------------------------------------
+# HEALTH CHECK
+# -----------------------------------------------------------------------------
+@app.get("/")
+def root():
+    return {"ok": True, "season": SEASON, "players_loaded": len(WEEKLY)}
