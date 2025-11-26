@@ -1,5 +1,7 @@
 fastapi
-uvicorn
+uvicorn[standard]
+pydantic
 pandas
-pyarrow
 requests
+pyarrow
+nfl_data_py
