@@ -4,3 +4,4 @@ pydantic
 nflreadpy
 pandas
 pyarrow
+nfl_data_py
