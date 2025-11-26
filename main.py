@@ -54,7 +54,8 @@ def clean_nans(value: Any) -> Any:
 
 
 def load_weekly_stats() -> pd.DataFrame:
-    def load_schedule() -> pd.DataFrame | None:
+    
+def load_schedule() -> pd.DataFrame | None:
     """
     Load NFL schedule for this season.
 
@@ -68,6 +69,7 @@ def load_weekly_stats() -> pd.DataFrame:
     except Exception:
         return None
 
+    # Convert politely-polars or pandas
     if isinstance(pl_df, pl.DataFrame):
         df = pl_df.to_pandas()
     elif isinstance(pl_df, pd.DataFrame):
@@ -75,29 +77,7 @@ def load_weekly_stats() -> pd.DataFrame:
     else:
         df = pd.DataFrame(pl_df)
 
-    return df
-
-    """
-    Load nflverse weekly player stats for one season.
-
-    By removing the cache, this will always pull the latest data
-    as nflverse updates (new weeks, updated stats, etc.).
-    """
-    pl_df = nfl.load_player_stats(
-        seasons=[SEASON],
-        summary_level="week",
-    )
-
-    # Polars -> pandas
-    if isinstance(pl_df, pl.DataFrame):
-        df = pl_df.to_pandas()
-    elif isinstance(pl_df, pd.DataFrame):
-        df = pl_df
-    else:
-        df = pd.DataFrame(pl_df)
-
-    return df
-    
+    return df    
 
 
 @app.get("/health")
