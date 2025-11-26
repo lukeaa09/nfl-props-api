@@ -279,6 +279,15 @@ VALID_STATS = {
 }
 
 
+VALID_STATS = {
+    "passing_yards": "passing_yards",
+    "rushing_yards": "rushing_yards",
+    "receiving_yards": "receiving_yards",
+    "receptions": "receptions",
+    "fantasy_points_ppr": "fantasy_points_ppr",
+}
+
+
 @app.get("/ai_picks")
 def ai_picks(
     week: int | None = None,
@@ -287,13 +296,16 @@ def ai_picks(
     limit: int = 20,
 ):
     """
-    Very simple 'AI' ranking of players for a given stat and upcoming week.
-    - Looks at all games BEFORE the given week.
-    - Computes per-player average, last-3-game average, and consistency.
-    - Produces a projection and a confidence / rating score.
+    Matchup-aware 'AI picks' endpoint.
 
-    This does NOT use sportsbook lines yet. It's just a projection + confidence
-    engine that we can later combine with real lines.
+    For a target week:
+      - Looks at all games BEFORE that week
+      - Projects the stat for each offensive player
+      - Adjusts based on:
+          * opponent defense vs that stat (rank)
+          * home vs away
+          * rough primetime flag
+      - Returns projection + confidence + matchup context
     """
 
     df = load_weekly_stats()
@@ -306,13 +318,285 @@ def ai_picks(
 
     stat_col = VALID_STATS[stat]
 
-    # Default "target week" = next week after the last week we have
     if "week" not in df.columns:
         return {
             "ok": False,
             "error": "No 'week' column in data",
             "columns": list(df.columns),
         }
+
+    max_week = int(df["week"].max())
+
+    # Target week: by default, "next" week after last one we have
+    if week is None:
+        target_week = max_week + 1
+    else:
+        target_week = int(week)
+
+    # Historical games only (no peeking into target week)
+    hist = df[df["week"] < target_week].copy()
+
+    # Positions to consider
+    if position is not None:
+        hist = hist[hist["position"] == position]
+    else:
+        hist = hist[hist["position"].isin(["QB", "RB", "WR", "TE"])]
+
+    if hist.empty:
+        return {
+            "ok": False,
+            "error": f"No historical data found before week {target_week} for the given filters.",
+        }
+
+    if stat_col not in hist.columns:
+        return {
+            "ok": False,
+            "error": f"Stat column '{stat_col}' not found in data.",
+            "columns": list(hist.columns),
+        }
+
+    # ---------------------------
+    # Defensive strength vs stat
+    # ---------------------------
+    # For each defense (opponent_team), how much of this stat do they allow per game?
+    def_allowed = (
+        hist.groupby("opponent_team")[stat_col]
+        .mean()
+        .dropna()
+        .rename("def_allowed_avg")
+    )
+
+    def_df = def_allowed.reset_index().rename(columns={"opponent_team": "def_team"})
+
+    if not def_df.empty:
+        # Rank defenses: 1 = toughest (lowest allowed), N = softest (highest allowed)
+        def_df["defense_rank_vs_stat"] = def_df["def_allowed_avg"].rank(
+            method="min", ascending=True
+        ).astype(int)
+        max_rank = int(def_df["defense_rank_vs_stat"].max())
+        # Softness score: 0 = toughest, 1 = softest
+        def_df["defense_softness"] = (
+            (def_df["defense_rank_vs_stat"] - 1) / max(1, (max_rank - 1))
+        )
+    else:
+        max_rank = 0
+
+    defense_map = (
+        def_df.set_index("def_team")[["def_allowed_avg", "defense_rank_vs_stat", "defense_softness"]]
+        if not def_df.empty
+        else None
+    )
+
+    # ---------------------------
+    # Schedule: home/away + primetime for target week
+    # ---------------------------
+    schedule_df = load_schedule()
+    schedule_map = None
+    if schedule_df is not None and {"season", "week", "home_team", "away_team"}.issubset(
+        schedule_df.columns
+    ):
+        # Only this season & target week
+        sched = schedule_df[
+            (schedule_df["season"] == SEASON) & (schedule_df["week"] == target_week)
+        ].copy()
+
+        # Build a lookup: (team -> matchup info)
+        records = []
+        for _, row in sched.iterrows():
+            home = row["home_team"]
+            away = row["away_team"]
+            gameday = row.get("gameday")
+            gametime = row.get("gametime")
+            weekday = row.get("weekday")
+
+            # Very rough primetime flag: MNF, TNF, SNF or time >= 20:00
+            is_night = False
+            try:
+                if isinstance(gametime, str) and len(gametime) >= 2:
+                    hour = int(gametime.split(":")[0])
+                    if hour >= 20:
+                        is_night = True
+                if isinstance(weekday, str) and weekday.upper() in {"MONDAY", "THURSDAY", "SUNDAY"}:
+                    # Many night games are on these days; we just keep the flag if already set
+                    is_night = True or is_night
+            except Exception:
+                pass
+
+            # Home team view
+            records.append(
+                {
+                    "team": home,
+                    "opponent": away,
+                    "is_home": True,
+                    "is_prime_time": bool(is_night),
+                    "gameday": gameday,
+                    "gametime": gametime,
+                    "weekday": weekday,
+                }
+            )
+            # Away team view
+            records.append(
+                {
+                    "team": away,
+                    "opponent": home,
+                    "is_home": False,
+                    "is_prime_time": bool(is_night),
+                    "gameday": gameday,
+                    "gametime": gametime,
+                    "weekday": weekday,
+                }
+            )
+
+        if records:
+            sched_map_df = pd.DataFrame.from_records(records)
+            schedule_map = sched_map_df.set_index("team")
+
+    picks: list[dict] = []
+
+    grouped = hist.groupby("player_id")
+
+    for player_id, g in grouped:
+        stat_series = g[stat_col].dropna()
+        games_played = int((~stat_series.isna()).sum())
+        if games_played < 3:
+            continue
+
+        avg = float(stat_series.mean())
+        std = float(stat_series.std(ddof=0)) if games_played > 1 else 0.0
+        last3_avg = float(stat_series.tail(3).mean())
+
+        # Base projection from averages
+        projection = 0.6 * avg + 0.4 * last3_avg
+
+        # Consistency: 0–1, higher = more consistent
+        epsilon = 1e-6
+        variability = std / (avg + epsilon) if avg > 0 else 1.0
+        consistency = 1.0 / (1.0 + variability)
+
+        # Base confidence from sample size (0–1)
+        base_conf = min(1.0, games_played / 10.0)
+
+        # Identity fields
+        last_row = g.iloc[-1]
+        name = last_row.get("player_display_name") or last_row.get("player_name")
+        team = last_row.get("team")
+        pos = last_row.get("position")
+
+        # ---------------------------
+        # Matchup context for target week
+        # ---------------------------
+        opponent = None
+        is_home = None
+        is_prime = None
+        gameday = None
+        gametime = None
+        weekday = None
+
+        if schedule_map is not None and team in schedule_map.index:
+            match = schedule_map.loc[team]
+            opponent = match.get("opponent")
+            is_home = bool(match.get("is_home"))
+            is_prime = bool(match.get("is_prime_time"))
+            gameday = match.get("gameday")
+            gametime = match.get("gametime")
+            weekday = match.get("weekday")
+
+        # Defense vs this stat
+        def_rank = None
+        def_allowed_avg = None
+        defense_softness = None
+
+        if opponent and defense_map is not None and opponent in defense_map.index:
+            drow = defense_map.loc[opponent]
+            def_allowed_avg = float(drow["def_allowed_avg"])
+            def_rank = int(drow["defense_rank_vs_stat"])
+            defense_softness = float(drow["defense_softness"])
+
+        # ---------------------------
+        # Apply context multipliers
+        # ---------------------------
+        context_mult_conf = 1.0
+        context_mult_proj = 1.0
+
+        # Defense softness: 0 = toughest, 1 = softest
+        if defense_softness is not None:
+            # Boost a little vs softer defenses, small penalty vs tough
+            # Range ~0.9–1.1
+            context_mult_conf *= 0.9 + 0.2 * defense_softness
+            context_mult_proj *= 0.95 + 0.1 * defense_softness
+
+        # Home field advantage
+        if is_home is True:
+            context_mult_conf *= 1.05
+            context_mult_proj *= 1.03
+        elif is_home is False:
+            context_mult_conf *= 0.97
+            context_mult_proj *= 0.98
+
+        # Primetime – tiny bump just to reflect "spotlight"
+        if is_prime is True:
+            context_mult_conf *= 1.02
+
+        # Final projection / confidence
+        projection_adj = projection * context_mult_proj
+        confidence_raw = 100 * base_conf * consistency * context_mult_conf
+        confidence = max(1, min(100, int(round(confidence_raw))))
+
+        rating = max(1, min(5, confidence // 20))
+
+        pick = {
+            "player_id": player_id,
+            "name": name,
+            "team": team,
+            "position": pos,
+            "stat": stat,
+            "target_week": target_week,
+            "projection": projection_adj,
+            "games_sampled": games_played,
+            "avg": avg,
+            "last3_avg": last3_avg,
+            "std": std,
+            "consistency": consistency,
+            "confidence": confidence,  # 0–100
+            "rating": rating,          # 1–5
+
+            # Matchup info
+            "opponent": opponent,
+            "defense_allowed_avg": def_allowed_avg,
+            "defense_rank_vs_stat": def_rank,
+            "is_home": is_home,
+            "is_prime_time": is_prime,
+            "gameday": gameday,
+            "gametime": gametime,
+            "weekday": weekday,
+        }
+
+        picks.append(pick)
+
+    if not picks:
+        return {
+            "ok": False,
+            "error": "No players had enough history for this stat.",
+        }
+
+    # Score: projection * (confidence scaled) – simple but works
+    def pick_score(p: dict) -> float:
+        return float(p["projection"]) * (p["confidence"] / 100.0)
+
+    picks_sorted = sorted(picks, key=pick_score, reverse=True)
+    picks_top = picks_sorted[: max(1, int(limit))]
+
+    picks_clean = clean_nans(picks_top)
+
+    return {
+        "ok": True,
+        "week": target_week,
+        "stat": stat,
+        "position": position,
+        "count": len(picks_clean),
+        "picks": picks_clean,
+    }
+
 
     max_week = int(df["week"].max())
     if week is None:
