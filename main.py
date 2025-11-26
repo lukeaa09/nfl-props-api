@@ -53,8 +53,7 @@ def clean_nans(value: Any) -> Any:
     return value
 
 
-def load_weekly_stats() -> pd.DataFrame:
-    
+def load_weekly_stats() -> pd.DataFrame:    
 def load_schedule() -> pd.DataFrame | None:
     """
     Load NFL schedule for this season.
