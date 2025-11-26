@@ -241,6 +241,173 @@ def player_detail(player_id: str, week: int | None = None):
         "overview": overview_clean,
         "weeklyLog": weekly_log_clean,
     }
+from math import sqrt
+
+# -----------------------
+# Simple AI picks endpoint
+# -----------------------
+
+VALID_STATS = {
+    "passing_yards": "passing_yards",
+    "rushing_yards": "rushing_yards",
+    "receiving_yards": "receiving_yards",
+    "receptions": "receptions",
+    "fantasy_points_ppr": "fantasy_points_ppr",
+}
+
+
+@app.get("/ai_picks")
+def ai_picks(
+    week: int | None = None,
+    position: str | None = None,
+    stat: str = "passing_yards",
+    limit: int = 20,
+):
+    """
+    Very simple 'AI' ranking of players for a given stat and upcoming week.
+    - Looks at all games BEFORE the given week.
+    - Computes per-player average, last-3-game average, and consistency.
+    - Produces a projection and a confidence / rating score.
+
+    This does NOT use sportsbook lines yet. It's just a projection + confidence
+    engine that we can later combine with real lines.
+    """
+
+    df = load_weekly_stats()
+
+    if stat not in VALID_STATS:
+        return {
+            "ok": False,
+            "error": f"Unsupported stat '{stat}'. Valid options: {sorted(VALID_STATS.keys())}",
+        }
+
+    stat_col = VALID_STATS[stat]
+
+    # Default "target week" = next week after the last week we have
+    if "week" not in df.columns:
+        return {
+            "ok": False,
+            "error": "No 'week' column in data",
+            "columns": list(df.columns),
+        }
+
+    max_week = int(df["week"].max())
+    if week is None:
+        target_week = max_week + 1
+    else:
+        target_week = int(week)
+
+    # Use ONLY weeks before the target week (no peeking into the future)
+    hist = df[df["week"] < target_week].copy()
+
+    # Offensive positions only, unless overridden
+    if position is not None:
+        hist = hist[hist["position"] == position]
+    else:
+        hist = hist[hist["position"].isin(["QB", "RB", "WR", "TE"])]
+
+    if hist.empty:
+        return {
+            "ok": False,
+            "error": f"No historical data found before week {target_week} for the given filters.",
+        }
+
+    if stat_col not in hist.columns:
+        return {
+            "ok": False,
+            "error": f"Stat column '{stat_col}' not found in data.",
+            "columns": list(hist.columns),
+        }
+
+    # Group by player and compute basic stats
+    picks: list[dict] = []
+    grouped = hist.groupby("player_id")
+
+    for player_id, g in grouped:
+        # Clean stat values
+        stat_series = g[stat_col].dropna()
+
+        # Require at least 3 games with that stat to trust it even a little
+        games_played = int((~stat_series.isna()).sum())
+        if games_played < 3:
+            continue
+
+        avg = float(stat_series.mean())
+        # Population std dev (ddof=0)
+        std = float(stat_series.std(ddof=0)) if games_played > 1 else 0.0
+
+        # Last 3 games average (if fewer than 3, it's just whatever we have)
+        last3_avg = float(stat_series.tail(3).mean())
+
+        # Simple projection: blend season-long average and last-3 average
+        projection = 0.6 * avg + 0.4 * last3_avg
+
+        # Consistency: higher if they are steady, lower if super volatile
+        # Add a tiny epsilon so we never divide by zero
+        epsilon = 1e-6
+        # "Coefficient of variation" type measure
+        variability = std / (avg + epsilon) if avg > 0 else 1.0
+        # Map variability to [0,1] where lower variability = closer to 1
+        consistency = 1.0 / (1.0 + variability)
+
+        # Base confidence grows with games played, capped at 1.0
+        base_conf = min(1.0, games_played / 10.0)
+
+        # Final confidence (0–100)
+        confidence = int(round(100 * base_conf * consistency))
+
+        # Map confidence to a 1–5 rating
+        rating = max(1, min(5, confidence // 20))
+
+        # Grab identity fields from one row
+        last_row = g.iloc[-1]
+        name = last_row.get("player_display_name") or last_row.get("player_name")
+        team = last_row.get("team")
+        pos = last_row.get("position")
+
+        picks.append(
+            {
+                "player_id": player_id,
+                "name": name,
+                "team": team,
+                "position": pos,
+                "stat": stat,
+                "projection": projection,
+                "games_sampled": games_played,
+                "avg": avg,
+                "last3_avg": last3_avg,
+                "std": std,
+                "consistency": consistency,
+                "confidence": confidence,  # 0–100
+                "rating": rating,          # 1–5
+            }
+        )
+
+    if not picks:
+        return {
+            "ok": False,
+            "error": "No players had enough history for this stat.",
+        }
+
+    # Sort by "score": projection * consistency * base_confidence
+    # (Confidence is already in the pick dict) – we recompute a rough score here
+    def pick_score(p: dict) -> float:
+        return float(p["projection"]) * (p["confidence"] / 100.0)
+
+    picks_sorted = sorted(picks, key=pick_score, reverse=True)
+    picks_top = picks_sorted[: max(1, int(limit))]
+
+    # Clean NaNs just in case
+    picks_clean = clean_nans(picks_top)
+
+    return {
+        "ok": True,
+        "week": target_week,
+        "stat": stat,
+        "position": position,
+        "count": len(picks_clean),
+        "picks": picks_clean,
+    }
 
 
 if __name__ == "__main__":
