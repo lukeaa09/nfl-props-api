@@ -1,50 +1,71 @@
+import io
 import os
 from typing import Optional, List, Dict, Any
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import requests
-import nfl_data_py as nfl
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-# ---------------------------------------
+# -------------------------------
 # CONFIG
-# ---------------------------------------
+# -------------------------------
+
 SEASON = 2025
 
-# Odds API key from Render env
+# Official nflverse player stats parquet (all seasons)
+PLAYER_STATS_URL = (
+    "https://github.com/nflverse/nflverse-data/"
+    "releases/download/player_stats/player_stats.parquet"
+)
+
+# The Odds API key (you already set this in Render)
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
 
-# ---------------------------------------
+# -------------------------------
 # DATA LOADERS
-# ---------------------------------------
+# -------------------------------
 
 def load_weekly_stats() -> pd.DataFrame:
     """
-    Load weekly player stats for SEASON using nfl_data_py.
+    Load weekly player stats for SEASON from nflverse player_stats.parquet.
+
     Filters to:
-      - this SEASON
+      - selected SEASON
       - regular season only
-      - offensive players (QB/RB/WR/TE)
-    Cleans NaN/inf so JSON is safe.
+      - offensive skill positions (QB/RB/WR/TE)
+    Cleans numeric columns so JSON doesn't blow up on NaN/inf.
     """
     try:
-        df = nfl.import_weekly_data([SEASON])
+        print("[startup] Downloading player_stats.parquet ...")
+        resp = requests.get(PLAYER_STATS_URL, timeout=90)
+        resp.raise_for_status()
+        buf = io.BytesIO(resp.content)
+        df = pd.read_parquet(buf)
     except Exception as e:
-        print("ERROR loading weekly data via nfl_data_py:", e)
+        print("ERROR loading player_stats parquet:", e)
         return pd.DataFrame()
 
-    # Regular season only
+    # Filter to this season + regular season
+    if "season" in df.columns:
+        df = df[df["season"] == SEASON]
+
     if "season_type" in df.columns:
         df = df[df["season_type"] == "REG"]
 
-    # Only offensive skill positions
-    if "position" in df.columns:
+    # Filter to offensive players only
+    if "position_group" in df.columns:
+        df = df[df["position_group"].isin(["QB", "RB", "WR", "TE"])]
+    elif "position" in df.columns:
         df = df[df["position"].isin(["QB", "RB", "WR", "TE"])]
 
     # Drop rows without player_id or week
+    if "player_id" not in df.columns or "week" not in df.columns:
+        print("WARNING: player_stats parquet missing player_id or week columns")
+        return pd.DataFrame()
+
     df = df[df["player_id"].notna() & df["week"].notna()]
 
     # Normalize types
@@ -52,9 +73,12 @@ def load_weekly_stats() -> pd.DataFrame:
     if "player_display_name" in df.columns:
         df["player_display_name"] = df["player_display_name"].fillna("Unknown Player")
     else:
-        df["player_display_name"] = df.get("player_name", "Unknown Player")
+        if "player_name" in df.columns:
+            df["player_display_name"] = df["player_name"].fillna("Unknown Player")
+        else:
+            df["player_display_name"] = "Unknown Player"
 
-    # Clean numeric columns so we don't explode JSON with NaN/inf
+    # Clean numeric columns
     numeric_cols = [
         col for col in df.columns
         if pd.api.types.is_numeric_dtype(df[col])
@@ -67,8 +91,8 @@ def load_weekly_stats() -> pd.DataFrame:
 
 def build_players_index(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Build index used for player search:
-      - id
+    Build a compact index of players for search:
+      - player_id
       - name
       - team
       - position
@@ -82,16 +106,31 @@ def build_players_index(df: pd.DataFrame) -> pd.DataFrame:
           .tail(1)
     )
 
-    index = latest[[
-        "player_id",
-        "player_display_name",
-        "team",
-        "position"
-    ]].drop_duplicates()
+    cols = []
+    for candidate in ["player_display_name", "player_name"]:
+        if candidate in latest.columns:
+            cols.append(candidate)
+            break
 
-    index = index.rename(columns={"player_display_name": "name"})
-    index["name_lower"] = index["name"].str.lower()
-    return index
+    cols.extend([c for c in ["team", "position"] if c in latest.columns])
+
+    base = latest[["player_id"] + cols].drop_duplicates()
+
+    if "player_display_name" in base.columns:
+        base = base.rename(columns={"player_display_name": "name"})
+    elif "player_name" in base.columns:
+        base = base.rename(columns={"player_name": "name"})
+    else:
+        base["name"] = "Unknown Player"
+
+    if "team" not in base.columns:
+        base["team"] = ""
+    if "position" not in base.columns:
+        base["position"] = ""
+
+    base["name_lower"] = base["name"].str.lower()
+
+    return base[["player_id", "name", "team", "position", "name_lower"]]
 
 
 def sanitize_row(row: pd.Series) -> Dict[str, Any]:
@@ -99,7 +138,8 @@ def sanitize_row(row: pd.Series) -> Dict[str, Any]:
     Convert a pandas row to a JSON-safe dict (no NaN/inf).
     """
     out: Dict[str, Any] = {}
-    for k, v in row.to_dict().items():
+    as_dict = row.to_dict()
+    for k, v in as_dict.items():
         if isinstance(v, float):
             if pd.isna(v) or v == float("inf") or v == float("-inf"):
                 out[k] = None
@@ -114,9 +154,53 @@ def sanitize_frame(df: pd.DataFrame) -> List[Dict[str, Any]]:
     return [sanitize_row(r) for _, r in df.iterrows()]
 
 
-# ---------------------------------------
+def get_player_payload(player_id: str, week: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Core logic used by both:
+      - /players/{player_id}
+      - /players/{player_id}/week/{week}
+    """
+    if WEEKLY.empty:
+        raise HTTPException(status_code=503, detail="Stats not loaded")
+
+    player_df = WEEKLY[WEEKLY["player_id"] == player_id]
+    if player_df.empty:
+        raise HTTPException(status_code=404, detail="Player not found")
+
+    weeks_with_data = sorted(player_df["week"].astype(int).unique().tolist())
+
+    if week is None:
+        selected_week = max(weeks_with_data)
+    else:
+        if week not in weeks_with_data:
+            raise HTTPException(status_code=404, detail="No data for that week")
+        selected_week = week
+
+    overview_row = player_df[player_df["week"] == selected_week].iloc[0]
+    overview = sanitize_row(overview_row)
+
+    weekly_log = sanitize_frame(player_df.sort_values("week"))
+
+    player_info = {
+        "id": overview.get("player_id"),
+        "name": overview.get("player_display_name"),
+        "team": overview.get("team"),
+        "position": overview.get("position"),
+    }
+
+    return {
+        "ok": True,
+        "player": player_info,
+        "selectedWeek": int(selected_week),
+        "weeksWithData": weeks_with_data,
+        "overview": overview,
+        "weeklyLog": weekly_log,
+    }
+
+
+# -------------------------------
 # LOAD DATA AT STARTUP
-# ---------------------------------------
+# -------------------------------
 
 WEEKLY: pd.DataFrame = load_weekly_stats()
 PLAYERS: pd.DataFrame = build_players_index(WEEKLY)
@@ -125,24 +209,24 @@ print(f"[startup] Loaded {len(WEEKLY)} weekly rows for season {SEASON}")
 print(f"[startup] Indexed {len(PLAYERS)} players")
 
 
-# ---------------------------------------
+# -------------------------------
 # FASTAPI APP
-# ---------------------------------------
+# -------------------------------
 
-app = FastAPI(title="NFL Props API", version="0.3.0")
+app = FastAPI(title="NFL Props API", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can lock this down later if you want
+    allow_origins=["*"],  # you can tighten this later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ---------------------------------------
-# HEALTH CHECK
-# ---------------------------------------
+# -------------------------------
+# ROOT / HEALTH
+# -------------------------------
 
 @app.get("/")
 def root():
@@ -155,16 +239,11 @@ def root():
     }
 
 
-# ---------------------------------------
-# /players/search?q=
-# ---------------------------------------
+# -------------------------------
+# PLAYER SEARCH
+# -------------------------------
 
-@app.get("/players/search")
-def search_players(q: str = Query("", description="Search by player name")):
-    """
-    Example:
-      /players/search?q=mahomes
-    """
+def _search_players(q: str) -> Dict[str, Any]:
     if PLAYERS.empty:
         return {"players": []}
 
@@ -187,66 +266,55 @@ def search_players(q: str = Query("", description="Search by player name")):
     return {"players": players}
 
 
-# ---------------------------------------
-# /players/{player_id}/week/{week}
-# ---------------------------------------
+@app.get("/players")
+def players(q: str = Query("", description="Search by player name")):
+    """
+    Example:
+      /players?q=mahomes
+    """
+    return _search_players(q)
+
+
+@app.get("/players/search")
+def players_search(q: str = Query("", description="Search by player name")):
+    """
+    Same as /players for compatibility.
+    """
+    return _search_players(q)
+
+
+# -------------------------------
+# PLAYER DETAILS
+# -------------------------------
+
+@app.get("/players/{player_id}")
+def player_details(player_id: str, week: Optional[int] = Query(None)):
+    """
+    Example:
+      /players/00-0033873           -> latest week
+      /players/00-0033873?week=8    -> specific week
+    """
+    return get_player_payload(player_id, week)
+
 
 @app.get("/players/{player_id}/week/{week}")
-def player_week(player_id: str, week: int):
+def player_details_week(player_id: str, week: int):
     """
     Example:
       /players/00-0033873/week/8
-    Returns:
-      - player basic info
-      - selected week overview
-      - list of weeksWithData
-      - full weeklyLog
     """
-    if WEEKLY.empty:
-        raise HTTPException(status_code=503, detail="Stats not loaded")
-
-    player_df = WEEKLY[WEEKLY["player_id"] == player_id]
-    if player_df.empty:
-        raise HTTPException(status_code=404, detail="Player not found")
-
-    weeks_with_data = sorted(player_df["week"].astype(int).unique().tolist())
-    if week not in weeks_with_data:
-        raise HTTPException(status_code=404, detail="No data for that week")
-
-    overview_row = player_df[player_df["week"] == week].iloc[0]
-    overview = sanitize_row(overview_row)
-
-    weekly_log = sanitize_frame(
-        player_df.sort_values("week")
-    )
-
-    player_info = {
-        "id": overview.get("player_id"),
-        "name": overview.get("player_display_name"),
-        "team": overview.get("team"),
-        "position": overview.get("position"),
-    }
-
-    return {
-        "ok": True,
-        "player": player_info,
-        "selectedWeek": int(week),
-        "weeksWithData": weeks_with_data,
-        "overview": overview,
-        "weeklyLog": weekly_log,
-    }
+    return get_player_payload(player_id, week)
 
 
-# ---------------------------------------
-# BASIC ODDS API PASSTHROUGH (can upgrade later)
-# ---------------------------------------
+# -------------------------------
+# ODDS API PASSTHROUGH
+# -------------------------------
 
 @app.get("/player-props/week/{week}")
 def player_props_week(week: int):
     """
-    Right now this just fetches current player prop odds from The Odds API.
-    We ignore the 'week' for now because The Odds API is event/date based,
-    not NFL-week based. Later we can map by kickoff date.
+    Raw passthrough from The Odds API for now.
+    We'll hook this into your picks logic later.
     """
     if not ODDS_API_KEY:
         raise HTTPException(status_code=500, detail="ODDS_API_KEY not set")
@@ -266,27 +334,6 @@ def player_props_week(week: int):
                 status_code=resp.status_code,
                 detail=f"Odds API error: {resp.text}",
             )
-        # For now, just return raw odds API data so we can inspect it
         return resp.json()
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Failed to call Odds API: {e}")
-
-from fastapi import HTTPException  # make sure this import is at the top of the file already
-
-@app.get("/debug-weekly")
-def debug_weekly():
-    """
-    Debug endpoint: try to load weekly data directly from nfl_data_py
-    so we can see if it's returning rows or erroring.
-    """
-    try:
-        df = nfl.import_weekly_data([SEASON])
-        return {
-            "ok": True,
-            "season": SEASON,
-            "rows": int(df.shape[0]),
-            "columns_sample": list(df.columns)[:15],
-        }
-    except Exception as e:
-        # This will show us the exact error message in the browser
-        raise HTTPException(status_code=500, detail=str(e))
