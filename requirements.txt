@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 pydantic
 nflreadpy
-polars
 pandas
+polars
 numpy
+pyarrow
