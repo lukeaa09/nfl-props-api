@@ -287,6 +287,7 @@ def player_detail(player_id: str, week: int | None = None):
 # -----------------------
 # AI picks (matchup-aware)
 # -----------------------
+
 VALID_STATS = {
     "passing_yards": "passing_yards",
     "rushing_yards": "rushing_yards",
@@ -294,6 +295,28 @@ VALID_STATS = {
     "receptions": "receptions",
     "fantasy_points_ppr": "fantasy_points_ppr",
 }
+
+
+def _time_bucket(gametime: str | None) -> str | None:
+    """
+    Turn gametime like '13:00:00' into a simple bucket:
+    - 'early'       ~ 1pm local
+    - 'afternoon'   ~ 3-4pm
+    - 'night'       ~ 7pm+
+    """
+    if not isinstance(gametime, str):
+        return None
+    try:
+        hour = int(gametime.split(":")[0])
+    except Exception:
+        return None
+
+    if hour < 14:
+        return "early"
+    elif hour < 19:
+        return "afternoon"
+    else:
+        return "night"
 
 
 @app.get("/ai_picks")
@@ -308,12 +331,13 @@ def ai_picks(
 
     For a target week:
       - Looks at all games BEFORE that week
-      - Projects the stat for each offensive player
-      - Adjusts based on:
-          * opponent defense vs that stat (rank & softness)
+      - Projects the chosen stat for each offensive player
+      - Adjusts projection + confidence using:
+          * defense vs that stat (avg allowed, rank, softness)
           * home vs away
-          * rough primetime flag
-      - Returns projection + confidence + matchup context
+          * time bucket (early / afternoon / night)
+          * rough 'primetime' flag
+      - Returns projection + confidence + matchup context + short explanation
 
     This is for analytics / education only, not betting advice.
     """
@@ -346,7 +370,7 @@ def ai_picks(
     # Historical games only (no peeking into target week)
     hist = df[df["week"] < target_week].copy()
 
-    # Positions to consider
+    # Filter by position if provided, otherwise only offensive positions
     if position is not None:
         hist = hist[hist["position"] == position]
     else:
@@ -414,22 +438,18 @@ def ai_picks(
             gametime = row.get("gametime")
             weekday = row.get("weekday")
 
-            # Very rough primetime flag: MNF/TNF/SNF or time >= 20:00
+            bucket = _time_bucket(gametime)
+
+            # Very rough primetime flag: night bucket OR usual primetime days
             is_night = False
-            try:
-                if isinstance(gametime, str) and len(gametime) >= 2:
-                    hour = int(gametime.split(":")[0])
-                    if hour >= 20:
-                        is_night = True
-                if isinstance(weekday, str) and weekday.upper() in {
-                    "MONDAY",
-                    "THURSDAY",
-                    "SUNDAY",
-                }:
-                    # many spotlight games are on these days
-                    is_night = True or is_night
-            except Exception:
-                pass
+            if bucket == "night":
+                is_night = True
+            if isinstance(weekday, str) and weekday.upper() in {
+                "MONDAY",
+                "THURSDAY",
+                "SUNDAY",
+            }:
+                is_night = True or is_night
 
             # Home team view
             records.append(
@@ -438,6 +458,7 @@ def ai_picks(
                     "opponent": away,
                     "is_home": True,
                     "is_prime_time": bool(is_night),
+                    "time_bucket": bucket,
                     "gameday": gameday,
                     "gametime": gametime,
                     "weekday": weekday,
@@ -450,6 +471,7 @@ def ai_picks(
                     "opponent": home,
                     "is_home": False,
                     "is_prime_time": bool(is_night),
+                    "time_bucket": bucket,
                     "gameday": gameday,
                     "gametime": gametime,
                     "weekday": weekday,
@@ -468,6 +490,7 @@ def ai_picks(
         stat_series = g[stat_col].dropna()
         games_played = int((~stat_series.isna()).sum())
         if games_played < 3:
+            # Not enough history to trust any projection
             continue
 
         avg = float(stat_series.mean())
@@ -495,6 +518,7 @@ def ai_picks(
         opponent = None
         is_home = None
         is_prime = None
+        time_bucket = None
         gameday = None
         gametime = None
         weekday = None
@@ -504,6 +528,7 @@ def ai_picks(
             opponent = match.get("opponent")
             is_home = bool(match.get("is_home"))
             is_prime = bool(match.get("is_prime_time"))
+            time_bucket = match.get("time_bucket")
             gameday = match.get("gameday")
             gametime = match.get("gametime")
             weekday = match.get("weekday")
@@ -541,12 +566,38 @@ def ai_picks(
         if is_prime is True:
             context_mult_conf *= 1.02
 
+        # Time bucket (night games can be a bit more volatile)
+        if time_bucket == "night":
+            context_mult_conf *= 0.98  # slightly more variance
+        elif time_bucket == "early":
+            context_mult_conf *= 1.01
+
         # Final projection / confidence
         projection_adj = projection * context_mult_proj
         confidence_raw = 100 * base_conf * consistency * context_mult_conf
         confidence = max(1, min(100, int(round(confidence_raw))))
-
         rating = max(1, min(5, confidence // 20))
+
+        # Short explanation string for UI
+        reasons = []
+        reasons.append(f"Avg {avg:.1f} {stat.replace('_', ' ')} on {games_played} games")
+        reasons.append(f"Last 3 avg {last3_avg:.1f}")
+        if def_rank is not None and opponent is not None:
+            reasons.append(
+                f"vs {opponent} defense ranked {def_rank} vs this stat"
+            )
+        if is_home is True:
+            reasons.append("home game")
+        elif is_home is False:
+            reasons.append("away game")
+
+        if time_bucket:
+            reasons.append(f"{time_bucket} kickoff")
+
+        if is_prime:
+            reasons.append("possible primetime spotlight")
+
+        explanation = ", ".join(reasons)
 
         pick = {
             "player_id": player_id,
@@ -561,18 +612,23 @@ def ai_picks(
             "last3_avg": last3_avg,
             "std": std,
             "consistency": consistency,
-            "confidence": confidence,  # 0–100
+            "confidence": confidence,  # 1–100
             "rating": rating,          # 1–5
 
             # Matchup info
             "opponent": opponent,
             "defense_allowed_avg": def_allowed_avg,
             "defense_rank_vs_stat": def_rank,
+            "defense_softness": defense_softness,
             "is_home": is_home,
             "is_prime_time": is_prime,
+            "time_bucket": time_bucket,
             "gameday": gameday,
             "gametime": gametime,
             "weekday": weekday,
+
+            # Human-readable summary
+            "explanation": explanation,
         }
 
         picks.append(pick)
@@ -600,6 +656,7 @@ def ai_picks(
         "count": len(picks_clean),
         "picks": picks_clean,
     }
+
 
 
 if __name__ == "__main__":
