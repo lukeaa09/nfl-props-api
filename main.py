@@ -270,3 +270,23 @@ def player_props_week(week: int):
         return resp.json()
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Failed to call Odds API: {e}")
+
+from fastapi import HTTPException  # make sure this import is at the top of the file already
+
+@app.get("/debug-weekly")
+def debug_weekly():
+    """
+    Debug endpoint: try to load weekly data directly from nfl_data_py
+    so we can see if it's returning rows or erroring.
+    """
+    try:
+        df = nfl.import_weekly_data([SEASON])
+        return {
+            "ok": True,
+            "season": SEASON,
+            "rows": int(df.shape[0]),
+            "columns_sample": list(df.columns)[:15],
+        }
+    except Exception as e:
+        # This will show us the exact error message in the browser
+        raise HTTPException(status_code=500, detail=str(e))
