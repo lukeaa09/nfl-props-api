@@ -4,4 +4,4 @@ pydantic
 pandas
 requests
 pyarrow
-nfl-data-py
+numpy
