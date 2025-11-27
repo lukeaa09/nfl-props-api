@@ -294,6 +294,8 @@ VALID_STATS = {
     "receiving_yards": "receiving_yards",
     "receptions": "receptions",
     "fantasy_points_ppr": "fantasy_points_ppr",
+    # Derived stat: rushing + receiving + return/def TDs
+    "anytime_tds": "anytime_tds",
 }
 
 
@@ -319,6 +321,14 @@ def _time_bucket(gametime: str | None) -> str | None:
         return "night"
 
 
+def _pretty_stat_name(stat: str) -> str:
+    if stat == "anytime_tds":
+        return "anytime TDs"
+    if stat == "fantasy_points_ppr":
+        return "PPR fantasy points"
+    return stat.replace("_", " ")
+
+
 @app.get("/ai_picks")
 def ai_picks(
     week: int | None = None,
@@ -337,7 +347,14 @@ def ai_picks(
           * home vs away
           * time bucket (early / afternoon / night)
           * rough 'primetime' flag
-      - Returns projection + confidence + matchup context + short explanation
+
+    Supported stats include:
+      - passing_yards
+      - rushing_yards
+      - receiving_yards
+      - receptions
+      - fantasy_points_ppr
+      - anytime_tds (derived: rush + rec + return/def TDs)
 
     This is for analytics / education only, not betting advice.
     """
@@ -350,7 +367,25 @@ def ai_picks(
             "error": f"Unsupported stat '{stat}'. Valid options: {sorted(VALID_STATS.keys())}",
         }
 
-    stat_col = VALID_STATS[stat]
+    # If we're doing TD props, build a derived column
+    if stat == "anytime_tds":
+        # Start with zero Series of correct length
+        base = pd.Series(0, index=df.index, dtype="float")
+
+        for col in [
+            "rushing_tds",
+            "receiving_tds",
+            "special_teams_tds",
+            "def_tds",
+            "fumble_recovery_tds",
+        ]:
+            if col in df.columns:
+                base = base + df[col].fillna(0)
+
+        df["_anytime_tds"] = base
+        stat_col = "_anytime_tds"
+    else:
+        stat_col = VALID_STATS[stat]
 
     if "week" not in df.columns:
         return {
@@ -579,9 +614,10 @@ def ai_picks(
         rating = max(1, min(5, confidence // 20))
 
         # Short explanation string for UI
+        stat_label = _pretty_stat_name(stat)
         reasons = []
-        reasons.append(f"Avg {avg:.1f} {stat.replace('_', ' ')} on {games_played} games")
-        reasons.append(f"Last 3 avg {last3_avg:.1f}")
+        reasons.append(f"Avg {avg:.2f} {stat_label} on {games_played} games")
+        reasons.append(f"Last 3 avg {last3_avg:.2f}")
         if def_rank is not None and opponent is not None:
             reasons.append(
                 f"vs {opponent} defense ranked {def_rank} vs this stat"
@@ -656,6 +692,7 @@ def ai_picks(
         "count": len(picks_clean),
         "picks": picks_clean,
     }
+
 
 
 
