@@ -396,11 +396,14 @@ def ai_picks(
 
     max_week = int(df["week"].max())
 
-    # Target week: default = next week after last completed week
-    if week is None:
-        target_week = max_week + 1
-    else:
-        target_week = int(week)
+# Target week: default = current week (max_week)
+# Historical stats will still only use weeks < target_week,
+# so for week 13 it uses weeks 1–12.
+if week is None:
+    target_week = max_week
+else:
+    target_week = int(week)
+
 
     # Historical games only (no peeking into target week)
     hist = df[df["week"] < target_week].copy()
