@@ -1,44 +1,32 @@
-from typing import Any, Dict, List, Optional
-
-import pandas as pd
-import polars as pl
-import nflreadpy as nfl
-
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-
-
-# -------------------------------------------------------
-# Basic config
-# -------------------------------------------------------
+import nflreadpy as nfl
+import pandas as pd
+import polars as pl
+from typing import Any, Optional
 
 SEASON = 2025
 
 app = FastAPI(
     title="NFL Props API",
-    description=(
-        "Simple API that exposes nflverse weekly player stats and "
-        "basic matchup-aware projections for educational/analytics use."
-    ),
-    version="3.0.0",
+    description="Simple API that exposes nflverse weekly player stats and basic AI picks",
+    version="3.1.0",
 )
 
-# Allow the Loveable front-end (and others) to call this API
+# Allow your frontend to talk to this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can lock this down to your domain later
+    allow_origins=["*"],  # you can lock this down later to your domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# -------------------------------------------------------
-# Global error handler (so the frontend sees JSON, not HTML)
-# -------------------------------------------------------
-
-
+# -----------------------
+# Global error handler
+# -----------------------
 @app.exception_handler(Exception)
 async def all_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
@@ -50,11 +38,9 @@ async def all_exception_handler(request: Request, exc: Exception):
     )
 
 
-# -------------------------------------------------------
-# Utility: clean NaNs for JSON
-# -------------------------------------------------------
-
-
+# -----------------------
+# Utility: clean NaNs
+# -----------------------
 def clean_nans(value: Any) -> Any:
     """
     Recursively replace NaN/NaT with None so JSON encoding doesn't break.
@@ -64,24 +50,18 @@ def clean_nans(value: Any) -> Any:
         if value != value:
             return None
         return value
-
     if isinstance(value, dict):
         return {k: clean_nans(v) for k, v in value.items()}
-
     if isinstance(value, list):
         return [clean_nans(v) for v in value]
-
     if isinstance(value, pd.Timestamp):
         return value.isoformat()
-
     return value
 
 
-# -------------------------------------------------------
-# Load weekly stats & schedule from nflverse
-# -------------------------------------------------------
-
-
+# -----------------------
+# Load weekly stats
+# -----------------------
 def load_weekly_stats() -> pd.DataFrame:
     """
     Load nflverse weekly player stats for the given season.
@@ -94,6 +74,7 @@ def load_weekly_stats() -> pd.DataFrame:
         summary_level="week",
     )
 
+    # Polars -> pandas
     if isinstance(pl_df, pl.DataFrame):
         df = pl_df.to_pandas()
     elif isinstance(pl_df, pd.DataFrame):
@@ -104,6 +85,9 @@ def load_weekly_stats() -> pd.DataFrame:
     return df
 
 
+# -----------------------
+# Load schedule (for home/away, opponent, primetime)
+# -----------------------
 def load_schedule() -> Optional[pd.DataFrame]:
     """
     Load NFL schedule for this season.
@@ -111,7 +95,7 @@ def load_schedule() -> Optional[pd.DataFrame]:
     Used to figure out:
       - who each team plays in a given week
       - whether they're home or away
-      - whether it's roughly a night/prime-time game
+      - whether it's (roughly) a night game
     """
     try:
         pl_df = nfl.load_schedules(seasons=[SEASON])
@@ -128,35 +112,11 @@ def load_schedule() -> Optional[pd.DataFrame]:
     return df
 
 
-# -------------------------------------------------------
-# Root / health / debug
-# -------------------------------------------------------
-
-
-@app.get("/")
-def root():
-    """
-    Simple root info. Mainly for sanity checks in the browser.
-    """
-    try:
-        df = load_weekly_stats()
-        max_week = int(df["week"].max()) if "week" in df.columns else None
-    except Exception:
-        max_week = None
-
-    return {
-        "ok": True,
-        "message": "NFL Props API",
-        "season": SEASON,
-        "current_data_week": max_week,
-    }
-
-
+# -----------------------
+# Basic endpoints
+# -----------------------
 @app.get("/health")
 def health():
-    """
-    Quick health check used by you and by the frontend.
-    """
     try:
         df = load_weekly_stats()
         return {
@@ -171,8 +131,7 @@ def health():
 @app.get("/debug_columns")
 def debug_columns():
     """
-    Debug endpoint: shows columns + a few sample rows.
-    Helpful if something breaks.
+    Just for debugging: shows columns + a few sample rows.
     """
     try:
         df = load_weekly_stats()
@@ -186,11 +145,9 @@ def debug_columns():
         return {"ok": False, "error": str(e)}
 
 
-# -------------------------------------------------------
+# -----------------------
 # /players: list/search
-# -------------------------------------------------------
-
-
+# -----------------------
 @app.get("/players")
 def list_players(q: Optional[str] = None):
     """
@@ -243,22 +200,17 @@ def list_players(q: Optional[str] = None):
     }
 
 
-# -------------------------------------------------------
-# /player/{id}: weekly detail
-# -------------------------------------------------------
-
-
+# -----------------------
+# /player/{id}: details
+# -----------------------
 @app.get("/player/{player_id}")
 def player_detail(player_id: str, week: Optional[int] = None):
     """
     Return weekly log + overview for a single player.
-
-    Response:
-      - player: identity info
-      - weeksWithData: which weeks they have stats
-      - selectedWeek: which week is currently selected
-      - overview: stats row for that week (or latest if week=None)
-      - weeklyLog: all weekly rows for that player
+    - weeksWithData: which weeks they have stats
+    - selectedWeek: which week is currently selected
+    - overview: stats row for that week (or latest if week=None)
+    - weeklyLog: all weekly rows for that player
     """
     df = load_weekly_stats()
 
@@ -306,7 +258,7 @@ def player_detail(player_id: str, week: Optional[int] = None):
 
     weekly_log = pdf_sorted.to_dict(orient="records")
 
-    # Identity fields (from the latest row)
+    # Identity fields
     first = pdf_sorted.iloc[-1]
     name = first.get("player_display_name") or first.get("player_name")
     team = first.get("team")
@@ -332,11 +284,10 @@ def player_detail(player_id: str, week: Optional[int] = None):
     }
 
 
-# -------------------------------------------------------
-# AI picks: yards / receptions / PPR
-# -------------------------------------------------------
-
-VALID_STATS: Dict[str, str] = {
+# -----------------------
+# AI picks (matchup-aware)
+# -----------------------
+VALID_STATS = {
     "passing_yards": "passing_yards",
     "rushing_yards": "rushing_yards",
     "receiving_yards": "receiving_yards",
@@ -346,97 +297,6 @@ VALID_STATS: Dict[str, str] = {
 
 
 @app.get("/ai_picks")
-# -----------------------
-# Combined AI picks across all stats
-# -----------------------
-
-COMBINED_STATS_FOR_PICKS = [
-    "passing_yards",
-    "rushing_yards",
-    "receiving_yards",
-    "receptions",
-    "fantasy_points_ppr",
-]
-
-
-@app.get("/ai_picks_combined")
-def ai_picks_combined(
-    week: int | None = None,
-    limit: int = 10,
-):
-    """
-    Combined AI picks across multiple stats.
-
-    - Calls ai_picks() for each stat in COMBINED_STATS_FOR_PICKS
-    - Merges all picks into one list
-    - Keeps the highest-confidence pick per (player_id, stat)
-    - Sorts by confidence desc, then projection desc
-    - Returns the top `limit` picks
-    """
-
-    all_picks: list[dict] = []
-    result_week: int | None = None
-
-    for stat in COMBINED_STATS_FOR_PICKS:
-        # Call the existing ai_picks() function directly
-        resp = ai_picks(
-            week=week,
-            position=None,   # let each stat decide positions
-            stat=stat,
-            limit=100,       # get a decent sample for each stat
-        )
-
-        # If ai_picks returned an error, skip this stat
-        if not isinstance(resp, dict) or not resp.get("ok"):
-            continue
-
-        if result_week is None:
-            result_week = resp.get("week")
-
-        picks = resp.get("picks", [])
-        if isinstance(picks, list):
-            all_picks.extend(picks)
-
-    if not all_picks:
-        return {
-            "ok": False,
-            "error": "No picks were available from underlying stats.",
-        }
-
-    # Deduplicate by (player_id, stat) and keep the highest-confidence version
-    unique: dict[tuple[str, str | None], dict] = {}
-    for p in all_picks:
-        player_id = p.get("player_id")
-        stat = p.get("stat")
-        if not player_id:
-            continue
-
-        key = (str(player_id), str(stat) if stat is not None else None)
-
-        existing = unique.get(key)
-        if existing is None or p.get("confidence", 0) > existing.get("confidence", 0):
-            unique[key] = p
-
-    combined_list = list(unique.values())
-
-    # Sort by confidence (desc), then projection (desc)
-    def score(p: dict) -> tuple[float, float]:
-        conf = float(p.get("confidence", 0))
-        proj = float(p.get("projection", 0.0))
-        return (conf, proj)
-
-    combined_list.sort(key=score, reverse=True)
-
-    top_n = combined_list[: max(1, int(limit))]
-
-    return {
-        "ok": True,
-        "week": result_week,
-        "limit": int(limit),
-        "count": len(top_n),
-        "picks": top_n,
-    }
-
 def ai_picks(
     week: Optional[int] = None,
     position: Optional[str] = None,
@@ -444,22 +304,29 @@ def ai_picks(
     limit: int = 20,
 ):
     """
-    Matchup-aware projection endpoint.
+    Matchup-aware 'AI picks' endpoint.
 
     For a target week:
       - Looks at all games BEFORE that week
-      - Projects the chosen stat for each offensive player
+      - Projects the stat for each offensive player
       - Adjusts based on:
           * opponent defense vs that stat (rank & softness)
           * home vs away
-          * rough prime-time flag
+          * rough primetime flag
       - Returns projection + confidence + matchup context
 
-    Default behavior:
-      - If no week is given, target_week = current data week (max_week)
-      - History uses weeks < target_week (so for week 13, uses weeks 1–12)
+    This is for analytics / education only, not betting advice.
     """
+
     df = load_weekly_stats()
+
+    if stat not in VALID_STATS:
+        return {
+            "ok": False,
+            "error": f"Unsupported stat '{stat}'. Valid options: {sorted(VALID_STATS.keys())}",
+        }
+
+    stat_col = VALID_STATS[stat]
 
     if "week" not in df.columns:
         return {
@@ -468,26 +335,15 @@ def ai_picks(
             "columns": list(df.columns),
         }
 
-    if stat not in VALID_STATS:
-        return {
-            "ok": False,
-            "error": (
-                f"Unsupported stat '{stat}'. "
-                f"Valid options: {sorted(VALID_STATS.keys())}"
-            ),
-        }
-
-    stat_col = VALID_STATS[stat]
-
     max_week = int(df["week"].max())
 
-    # ✅ Default to CURRENT week, not next week
+    # Target week: default = next week after last completed week
     if week is None:
-        target_week = max_week
+        target_week = max_week + 1
     else:
         target_week = int(week)
 
-    # Historical games only (no peeking into the target week)
+    # Historical games only (no peeking into target week)
     hist = df[df["week"] < target_week].copy()
 
     # Positions to consider
@@ -499,8 +355,7 @@ def ai_picks(
     if hist.empty:
         return {
             "ok": False,
-            "error": f"No historical data found before week {target_week} "
-            f"for the given filters.",
+            "error": f"No historical data found before week {target_week} for the given filters.",
         }
 
     if stat_col not in hist.columns:
@@ -529,7 +384,7 @@ def ai_picks(
             method="min", ascending=True
         ).astype(int)
         max_rank = int(def_df["defense_rank_vs_stat"].max())
-        # Softness: 0 = toughest, 1 = softest
+        # Softness score: 0 = toughest, 1 = softest
         def_df["defense_softness"] = (
             (def_df["defense_rank_vs_stat"] - 1) / max(1, (max_rank - 1))
         )
@@ -540,23 +395,18 @@ def ai_picks(
         defense_map = None
 
     # ---------------------------
-    # Schedule for target week:
-    # home/away + prime-time
+    # Schedule: home/away + primetime for target week
     # ---------------------------
     schedule_df = load_schedule()
     schedule_map = None
-    if schedule_df is not None and {
-        "season",
-        "week",
-        "home_team",
-        "away_team",
-    }.issubset(schedule_df.columns):
+    if schedule_df is not None and {"season", "week", "home_team", "away_team"}.issubset(
+        schedule_df.columns
+    ):
         sched = schedule_df[
-            (schedule_df["season"] == SEASON)
-            & (schedule_df["week"] == target_week)
+            (schedule_df["season"] == SEASON) & (schedule_df["week"] == target_week)
         ].copy()
 
-        records: List[Dict[str, Any]] = []
+        records = []
         for _, row in sched.iterrows():
             home = row["home_team"]
             away = row["away_team"]
@@ -564,7 +414,7 @@ def ai_picks(
             gametime = row.get("gametime")
             weekday = row.get("weekday")
 
-            # Rough prime-time flag: MNF/TNF/SNF or time >= 20:00
+            # Very rough primetime flag: MNF/TNF/SNF or time >= 20:00
             is_night = False
             try:
                 if isinstance(gametime, str) and len(gametime) >= 2:
@@ -609,10 +459,7 @@ def ai_picks(
             sched_map_df = pd.DataFrame.from_records(records)
             schedule_map = sched_map_df.set_index("team")
 
-    # ---------------------------
-    # Build picks
-    # ---------------------------
-    picks: List[Dict[str, Any]] = []
+    picks: list[dict] = []
 
     grouped = hist.groupby("player_id")
 
@@ -620,7 +467,6 @@ def ai_picks(
         stat_series = g[stat_col].dropna()
         games_played = int((~stat_series.isna()).sum())
         if games_played < 3:
-            # Need a little history to say anything reasonable
             continue
 
         avg = float(stat_series.mean())
@@ -690,7 +536,7 @@ def ai_picks(
             context_mult_conf *= 0.97
             context_mult_proj *= 0.98
 
-        # Prime time – tiny bump
+        # Primetime – tiny bump
         if is_prime is True:
             context_mult_conf *= 1.02
 
@@ -698,6 +544,7 @@ def ai_picks(
         projection_adj = projection * context_mult_proj
         confidence_raw = 100 * base_conf * consistency * context_mult_conf
         confidence = max(1, min(100, int(round(confidence_raw))))
+
         rating = max(1, min(5, confidence // 20))
 
         pick = {
@@ -713,7 +560,7 @@ def ai_picks(
             "last3_avg": last3_avg,
             "std": std,
             "consistency": consistency,
-            "confidence": confidence,  # 1–100
+            "confidence": confidence,  # 0–100
             "rating": rating,          # 1–5
 
             # Matchup info
@@ -736,7 +583,7 @@ def ai_picks(
         }
 
     # Score: projection * (confidence scaled) – simple ranking
-    def pick_score(p: Dict[str, Any]) -> float:
+    def pick_score(p: dict) -> float:
         return float(p["projection"]) * (p["confidence"] / 100.0)
 
     picks_sorted = sorted(picks, key=pick_score, reverse=True)
@@ -754,11 +601,9 @@ def ai_picks(
     }
 
 
-# -------------------------------------------------------
-# AI TD picks: "anytime TD" style signal
-# -------------------------------------------------------
-
-
+# -----------------------
+# AI TD picks (anytime TD style)
+# -----------------------
 @app.get("/ai_td_picks")
 def ai_td_picks(
     week: Optional[int] = None,
@@ -766,46 +611,39 @@ def ai_td_picks(
     limit: int = 20,
 ):
     """
-    Crude "anytime TD" style projection.
+    Simple "anytime TD" style projections.
 
-    For a target week:
-      - Looks at all games BEFORE that week
-      - Computes TD rate from passing/rushing/receiving TDs
-      - Adjusts with same matchup/home/primetime logic as /ai_picks
-      - Outputs a TD "projection" and confidence (0–100)
+    Uses:
+      td_events = passing_tds + rushing_tds + receiving_tds
 
-    This is still just analytics/education, not betting advice.
+    For each offensive player:
+      - looks at games before target week
+      - computes average & last3 avg TDs
+      - builds a projection + confidence
+
+    Educational/analytics only, not betting advice.
     """
     df = load_weekly_stats()
 
-    if "week" not in df.columns:
+    required_cols = {"player_id", "player_display_name", "team", "position",
+                     "week", "passing_tds", "rushing_tds", "receiving_tds"}
+    missing = required_cols - set(df.columns)
+    if missing:
         return {
             "ok": False,
-            "error": "No 'week' column in data",
-            "columns": list(df.columns),
-        }
-
-    required_td_cols = {"passing_tds", "rushing_tds", "receiving_tds"}
-    if not required_td_cols.issubset(df.columns):
-        return {
-            "ok": False,
-            "error": "Missing TD columns in data",
-            "missing": sorted(required_td_cols - set(df.columns)),
+            "error": f"Missing required columns for TD picks: {sorted(missing)}",
             "columns": list(df.columns),
         }
 
     max_week = int(df["week"].max())
-
-    # ✅ Default to CURRENT week, not next
     if week is None:
-        target_week = max_week
+        target_week = max_week + 1
     else:
         target_week = int(week)
 
-    # Historical games only
     hist = df[df["week"] < target_week].copy()
 
-    # Positions to consider
+    # Offensive positions only
     if position is not None:
         hist = hist[hist["position"] == position]
     else:
@@ -814,234 +652,179 @@ def ai_td_picks(
     if hist.empty:
         return {
             "ok": False,
-            "error": f"No historical data found before week {target_week} "
-            f"for the given filters.",
+            "error": f"No historical data found before week {target_week} for the given filters.",
         }
 
-    # Create a simple "td_events" per game
+    # TD events
     hist["td_events"] = (
         hist["passing_tds"].fillna(0)
         + hist["rushing_tds"].fillna(0)
         + hist["receiving_tds"].fillna(0)
     )
 
-    # Defense vs TDs: how many TD events they allow per game
-    def_td_allowed = (
-        hist.groupby("opponent_team")["td_events"]
-        .mean()
-        .dropna()
-        .rename("def_td_allowed_avg")
-    )
-
-    def_td_df = def_td_allowed.reset_index().rename(
-        columns={"opponent_team": "def_team"}
-    )
-
-    if not def_td_df.empty:
-        def_td_df["defense_rank_vs_td"] = def_td_df["def_td_allowed_avg"].rank(
-            method="min", ascending=True
-        ).astype(int)
-        max_rank_td = int(def_td_df["defense_rank_vs_td"].max())
-        def_td_df["defense_td_softness"] = (
-            (def_td_df["defense_rank_vs_td"] - 1) / max(1, (max_rank_td - 1))
-        )
-        defense_td_map = def_td_df.set_index("def_team")[
-            ["def_td_allowed_avg", "defense_rank_vs_td", "defense_td_softness"]
-        ]
-    else:
-        defense_td_map = None
-
-    # Schedule for target week
-    schedule_df = load_schedule()
-    schedule_map = None
-    if schedule_df is not None and {
-        "season",
-        "week",
-        "home_team",
-        "away_team",
-    }.issubset(schedule_df.columns):
-        sched = schedule_df[
-            (schedule_df["season"] == SEASON)
-            & (schedule_df["week"] == target_week)
-        ].copy()
-
-        records: List[Dict[str, Any]] = []
-        for _, row in sched.iterrows():
-            home = row["home_team"]
-            away = row["away_team"]
-            gameday = row.get("gameday")
-            gametime = row.get("gametime")
-            weekday = row.get("weekday")
-
-            is_night = False
-            try:
-                if isinstance(gametime, str) and len(gametime) >= 2:
-                    hour = int(gametime.split(":")[0])
-                    if hour >= 20:
-                        is_night = True
-                if isinstance(weekday, str) and weekday.upper() in {
-                    "MONDAY",
-                    "THURSDAY",
-                    "SUNDAY",
-                }:
-                    is_night = True or is_night
-            except Exception:
-                pass
-
-            records.append(
-                {
-                    "team": home,
-                    "opponent": away,
-                    "is_home": True,
-                    "is_prime_time": bool(is_night),
-                    "gameday": gameday,
-                    "gametime": gametime,
-                    "weekday": weekday,
-                }
-            )
-            records.append(
-                {
-                    "team": away,
-                    "opponent": home,
-                    "is_home": False,
-                    "is_prime_time": bool(is_night),
-                    "gameday": gameday,
-                    "gametime": gametime,
-                    "weekday": weekday,
-                }
-            )
-
-        if records:
-            sched_map_df = pd.DataFrame.from_records(records)
-            schedule_map = sched_map_df.set_index("team")
-
-    picks: List[Dict[str, Any]] = []
-
+    picks: list[dict] = []
     grouped = hist.groupby("player_id")
 
     for player_id, g in grouped:
-        td_series = g["td_events"].dropna()
-        games_played = int((~td_series.isna()).sum())
+        td_series = g["td_events"].fillna(0)
+        games_played = int(len(td_series))
         if games_played < 3:
             continue
 
         avg_td = float(td_series.mean())
+        last3_avg_td = float(td_series.tail(3).mean())
         std_td = float(td_series.std(ddof=0)) if games_played > 1 else 0.0
-        last3_td = float(td_series.tail(3).mean())
 
-        base_proj = 0.6 * avg_td + 0.4 * last3_td
+        # If they basically never score, skip as a TD prop candidate
+        if avg_td < 0.1 and last3_avg_td < 0.1:
+            continue
 
+        # Base projection
+        td_projection = 0.6 * avg_td + 0.4 * last3_avg_td
+
+        # Consistency & confidence
         epsilon = 1e-6
         variability = std_td / (avg_td + epsilon) if avg_td > 0 else 1.0
         consistency = 1.0 / (1.0 + variability)
-
         base_conf = min(1.0, games_played / 10.0)
+
+        confidence_raw = 100 * base_conf * consistency
+        confidence = max(1, min(100, int(round(confidence_raw))))
+        rating = max(1, min(5, confidence // 20))
 
         last_row = g.iloc[-1]
         name = last_row.get("player_display_name") or last_row.get("player_name")
         team = last_row.get("team")
         pos = last_row.get("position")
 
-        opponent = None
-        is_home = None
-        is_prime = None
-        gameday = None
-        gametime = None
-        weekday = None
-
-        if schedule_map is not None and team in schedule_map.index:
-            match = schedule_map.loc[team]
-            opponent = match.get("opponent")
-            is_home = bool(match.get("is_home"))
-            is_prime = bool(match.get("is_prime_time"))
-            gameday = match.get("gameday")
-            gametime = match.get("gametime")
-            weekday = match.get("weekday")
-
-        def_rank_td = None
-        def_td_allowed_avg = None
-        defense_td_softness = None
-
-        if opponent and defense_td_map is not None and opponent in defense_td_map.index:
-            drow = defense_td_map.loc[opponent]
-            def_td_allowed_avg = float(drow["def_td_allowed_avg"])
-            def_rank_td = int(drow["defense_rank_vs_td"])
-            defense_td_softness = float(drow["defense_td_softness"])
-
-        context_mult_conf = 1.0
-        context_mult_proj = 1.0
-
-        if defense_td_softness is not None:
-            context_mult_conf *= 0.9 + 0.2 * defense_td_softness
-            context_mult_proj *= 0.95 + 0.1 * defense_td_softness
-
-        if is_home is True:
-            context_mult_conf *= 1.05
-            context_mult_proj *= 1.03
-        elif is_home is False:
-            context_mult_conf *= 0.97
-            context_mult_proj *= 0.98
-
-        if is_prime is True:
-            context_mult_conf *= 1.02
-
-        proj_td_adj = base_proj * context_mult_proj
-        confidence_raw = 100 * base_conf * consistency * context_mult_conf
-        confidence = max(1, min(100, int(round(confidence_raw))))
-        rating = max(1, min(5, confidence // 20))
-
-        pick = {
-            "player_id": player_id,
-            "name": name,
-            "team": team,
-            "position": pos,
-            "target_week": target_week,
-            "td_projection": proj_td_adj,
-            "games_sampled": games_played,
-            "avg_td": avg_td,
-            "last3_td": last3_td,
-            "std_td": std_td,
-            "consistency": consistency,
-            "confidence": confidence,
-            "rating": rating,
-            "opponent": opponent,
-            "def_td_allowed_avg": def_td_allowed_avg,
-            "defense_rank_vs_td": def_rank_td,
-            "is_home": is_home,
-            "is_prime_time": is_prime,
-            "gameday": gameday,
-            "gametime": gametime,
-            "weekday": weekday,
-        }
-
-        picks.append(pick)
+        picks.append(
+            {
+                "player_id": player_id,
+                "name": name,
+                "team": team,
+                "position": pos,
+                "target_week": target_week,
+                "td_projection": td_projection,
+                "games_sampled": games_played,
+                "avg_tds": avg_td,
+                "last3_avg_tds": last3_avg_td,
+                "std_tds": std_td,
+                "consistency": consistency,
+                "confidence": confidence,
+                "rating": rating,
+            }
+        )
 
     if not picks:
         return {
             "ok": False,
-            "error": "No players had enough TD history.",
+            "error": "No players had enough TD history to project.",
         }
 
-    def pick_score(p: Dict[str, Any]) -> float:
+    def score(p: dict) -> float:
         return float(p["td_projection"]) * (p["confidence"] / 100.0)
 
-    picks_sorted = sorted(picks, key=pick_score, reverse=True)
-    picks_top = picks_sorted[: max(1, int(limit))]
-
-    picks_clean = clean_nans(picks_top)
+    picks_sorted = sorted(picks, key=score, reverse=True)
+    top = picks_sorted[: max(1, int(limit))]
+    top_clean = clean_nans(top)
 
     return {
         "ok": True,
         "week": target_week,
         "position": position,
-        "count": len(picks_clean),
-        "picks": picks_clean,
+        "count": len(top_clean),
+        "picks": top_clean,
     }
 
 
-# -------------------------------------------------------
-# Local dev entrypoint
-# -------------------------------------------------------
+# -----------------------
+# Combined AI picks across all stats
+# -----------------------
+COMBINED_STATS_FOR_PICKS = [
+    "passing_yards",
+    "rushing_yards",
+    "receiving_yards",
+    "receptions",
+    "fantasy_points_ppr",
+]
+
+
+@app.get("/ai_picks_combined")
+def ai_picks_combined(
+    week: Optional[int] = None,
+    limit: int = 10,
+):
+    """
+    Combined AI picks across multiple stats.
+
+    - Calls ai_picks() for each stat in COMBINED_STATS_FOR_PICKS
+    - Merges all picks into one list
+    - Keeps the highest-confidence pick per (player_id, stat)
+    - Sorts by confidence desc, then projection desc
+    - Returns the top `limit` picks
+    """
+
+    all_picks: list[dict] = []
+    result_week: Optional[int] = None
+
+    for stat in COMBINED_STATS_FOR_PICKS:
+        resp = ai_picks(
+            week=week,
+            position=None,
+            stat=stat,
+            limit=100,
+        )
+
+        if not isinstance(resp, dict) or not resp.get("ok"):
+            continue
+
+        if result_week is None:
+            result_week = resp.get("week")
+
+        picks = resp.get("picks", [])
+        if isinstance(picks, list):
+            all_picks.extend(picks)
+
+    if not all_picks:
+        return {
+            "ok": False,
+            "error": "No picks were available from underlying stats.",
+        }
+
+    # Deduplicate by (player_id, stat) and keep the highest-confidence version
+    unique: dict[tuple[str, str | None], dict] = {}
+    for p in all_picks:
+        player_id = p.get("player_id")
+        stat = p.get("stat")
+        if not player_id:
+            continue
+
+        key = (str(player_id), str(stat) if stat is not None else None)
+        existing = unique.get(key)
+        if existing is None or p.get("confidence", 0) > existing.get("confidence", 0):
+            unique[key] = p
+
+    combined_list = list(unique.values())
+
+    # Sort by confidence (desc), then projection (desc)
+    def sort_key(p: dict) -> tuple[float, float]:
+        conf = float(p.get("confidence", 0))
+        proj = float(p.get("projection", 0.0))
+        return (conf, proj)
+
+    combined_list.sort(key=sort_key, reverse=True)
+
+    top_n = combined_list[: max(1, int(limit))]
+    top_clean = clean_nans(top_n)
+
+    return {
+        "ok": True,
+        "week": result_week,
+        "limit": int(limit),
+        "count": len(top_clean),
+        "picks": top_clean,
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
