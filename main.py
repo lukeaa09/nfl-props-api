@@ -346,6 +346,97 @@ VALID_STATS: Dict[str, str] = {
 
 
 @app.get("/ai_picks")
+# -----------------------
+# Combined AI picks across all stats
+# -----------------------
+
+COMBINED_STATS_FOR_PICKS = [
+    "passing_yards",
+    "rushing_yards",
+    "receiving_yards",
+    "receptions",
+    "fantasy_points_ppr",
+]
+
+
+@app.get("/ai_picks_combined")
+def ai_picks_combined(
+    week: int | None = None,
+    limit: int = 10,
+):
+    """
+    Combined AI picks across multiple stats.
+
+    - Calls ai_picks() for each stat in COMBINED_STATS_FOR_PICKS
+    - Merges all picks into one list
+    - Keeps the highest-confidence pick per (player_id, stat)
+    - Sorts by confidence desc, then projection desc
+    - Returns the top `limit` picks
+    """
+
+    all_picks: list[dict] = []
+    result_week: int | None = None
+
+    for stat in COMBINED_STATS_FOR_PICKS:
+        # Call the existing ai_picks() function directly
+        resp = ai_picks(
+            week=week,
+            position=None,   # let each stat decide positions
+            stat=stat,
+            limit=100,       # get a decent sample for each stat
+        )
+
+        # If ai_picks returned an error, skip this stat
+        if not isinstance(resp, dict) or not resp.get("ok"):
+            continue
+
+        if result_week is None:
+            result_week = resp.get("week")
+
+        picks = resp.get("picks", [])
+        if isinstance(picks, list):
+            all_picks.extend(picks)
+
+    if not all_picks:
+        return {
+            "ok": False,
+            "error": "No picks were available from underlying stats.",
+        }
+
+    # Deduplicate by (player_id, stat) and keep the highest-confidence version
+    unique: dict[tuple[str, str | None], dict] = {}
+    for p in all_picks:
+        player_id = p.get("player_id")
+        stat = p.get("stat")
+        if not player_id:
+            continue
+
+        key = (str(player_id), str(stat) if stat is not None else None)
+
+        existing = unique.get(key)
+        if existing is None or p.get("confidence", 0) > existing.get("confidence", 0):
+            unique[key] = p
+
+    combined_list = list(unique.values())
+
+    # Sort by confidence (desc), then projection (desc)
+    def score(p: dict) -> tuple[float, float]:
+        conf = float(p.get("confidence", 0))
+        proj = float(p.get("projection", 0.0))
+        return (conf, proj)
+
+    combined_list.sort(key=score, reverse=True)
+
+    top_n = combined_list[: max(1, int(limit))]
+
+    return {
+        "ok": True,
+        "week": result_week,
+        "limit": int(limit),
+        "count": len(top_n),
+        "picks": top_n,
+    }
+
 def ai_picks(
     week: Optional[int] = None,
     position: Optional[str] = None,
