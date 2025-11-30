@@ -339,7 +339,7 @@ def ai_picks(
 
     # Target week: default = next week after last completed week
     if week is None:
-        target_week = max_week + 1
+        target_week = max_week
     else:
         target_week = int(week)
 
