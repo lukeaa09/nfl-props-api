@@ -607,26 +607,32 @@ def ai_picks(
 @app.get("/ai_td_picks")
 def ai_td_picks(
     week: Optional[int] = None,
-    position: Optional[str] = None,
     limit: int = 20,
 ):
     """
-    Simple "anytime TD" style projections.
+    Touchdown props AI endpoint.
 
-    Uses:
-      td_events = passing_tds + rushing_tds + receiving_tds
+    Produces two types of TD props:
+      - 'passing'  -> passing TD props (QBs only)
+      - 'anytime'  -> rushing + receiving TD props (QB, RB, WR, TE)
 
-    For each offensive player:
-      - looks at games before target week
-      - computes average & last3 avg TDs
-      - builds a projection + confidence
-
-    Educational/analytics only, not betting advice.
+    Rules:
+      - Only offensive positions: QB, RB, WR, TE
+      - No defensive or return TD props
+      - Sorted from highest confidence to lowest
     """
     df = load_weekly_stats()
 
-    required_cols = {"player_id", "player_display_name", "team", "position",
-                     "week", "passing_tds", "rushing_tds", "receiving_tds"}
+    required_cols = {
+        "player_id",
+        "player_display_name",
+        "team",
+        "position",
+        "week",
+        "passing_tds",
+        "rushing_tds",
+        "receiving_tds",
+    }
     missing = required_cols - set(df.columns)
     if missing:
         return {
@@ -635,49 +641,52 @@ def ai_td_picks(
             "columns": list(df.columns),
         }
 
+    # Figure out current week from data
     max_week = int(df["week"].max())
+
+    # You already changed your other endpoints to use current week, so
+    # we follow the same idea here:
     if week is None:
-        target_week = max_week + 1
+        target_week = max_week
     else:
         target_week = int(week)
 
+    # Only use games BEFORE the target week to avoid "peeking"
     hist = df[df["week"] < target_week].copy()
 
     # Offensive positions only
-    if position is not None:
-        hist = hist[hist["position"] == position]
-    else:
-        hist = hist[hist["position"].isin(["QB", "RB", "WR", "TE"])]
+    hist = hist[hist["position"].isin(["QB", "RB", "WR", "TE"])]
 
     if hist.empty:
         return {
             "ok": False,
-            "error": f"No historical data found before week {target_week} for the given filters.",
+            "error": f"No historical data found before week {target_week} for offensive players.",
         }
 
-    # TD events
-    hist["td_events"] = (
-        hist["passing_tds"].fillna(0)
-        + hist["rushing_tds"].fillna(0)
-        + hist["receiving_tds"].fillna(0)
-    )
-
     picks: list[dict] = []
-    grouped = hist.groupby("player_id")
 
-    for player_id, g in grouped:
-        td_series = g["td_events"].fillna(0)
+    def build_td_pick(
+        series: pd.Series,
+        player_row: pd.Series,
+        td_type: str,
+        target_week: int,
+    ) -> Optional[dict]:
+        """
+        Build a single TD prop candidate (passing OR anytime) for one player.
+        td_type: 'passing' or 'anytime'
+        """
+        td_series = series.fillna(0)
         games_played = int(len(td_series))
         if games_played < 3:
-            continue
+            return None
 
         avg_td = float(td_series.mean())
         last3_avg_td = float(td_series.tail(3).mean())
         std_td = float(td_series.std(ddof=0)) if games_played > 1 else 0.0
 
-        # If they basically never score, skip as a TD prop candidate
-        if avg_td < 0.1 and last3_avg_td < 0.1:
-            continue
+        # If they basically never score in this way, skip
+        if avg_td < 0.05 and last3_avg_td < 0.05:
+            return None
 
         # Base projection
         td_projection = 0.6 * avg_td + 0.4 * last3_avg_td
@@ -692,28 +701,71 @@ def ai_td_picks(
         confidence = max(1, min(100, int(round(confidence_raw))))
         rating = max(1, min(5, confidence // 20))
 
+        name = player_row.get("player_display_name") or player_row.get("player_name")
+        team = player_row.get("team")
+        pos = player_row.get("position")
+        player_id = player_row.get("player_id")
+
+        return {
+            "player_id": player_id,
+            "name": name,
+            "team": team,
+            "position": pos,
+            "target_week": target_week,
+            "td_type": td_type,                 # 'passing' or 'anytime'
+            "td_projection": td_projection,     # expected TDs per game in that category
+            "games_sampled": games_played,
+            "avg_tds": avg_td,
+            "last3_avg_tds": last3_avg_td,
+            "std_tds": std_td,
+            "consistency": consistency,
+            "confidence": confidence,
+            "rating": rating,
+        }
+
+    grouped = hist.groupby("player_id")
+
+    for player_id, g in grouped:
+        # Latest row for identity / team / position
         last_row = g.iloc[-1]
-        name = last_row.get("player_display_name") or last_row.get("player_name")
-        team = last_row.get("team")
         pos = last_row.get("position")
 
-        picks.append(
-            {
-                "player_id": player_id,
-                "name": name,
-                "team": team,
-                "position": pos,
-                "target_week": target_week,
-                "td_projection": td_projection,
-                "games_sampled": games_played,
-                "avg_tds": avg_td,
-                "last3_avg_tds": last3_avg_td,
-                "std_tds": std_td,
-                "consistency": consistency,
-                "confidence": confidence,
-                "rating": rating,
-            }
-        )
+        # Series for different TD types
+        passing_series = g["passing_tds"]
+        rushing_series = g["rushing_tds"]
+        receiving_series = g["receiving_tds"]
+
+        # Anytime TD: rushing + receiving (no passing, no returns, no defense)
+        anytime_series = rushing_series.fillna(0) + receiving_series.fillna(0)
+
+        # QBs: can have BOTH passing TD props and anytime TD props (rushing / receiving)
+        if pos == "QB":
+            passing_pick = build_td_pick(
+                passing_series,
+                last_row,
+                td_type="passing",
+                target_week=target_week,
+            )
+            anytime_pick = build_td_pick(
+                anytime_series,
+                last_row,
+                td_type="anytime",
+                target_week=target_week,
+            )
+            if passing_pick:
+                picks.append(passing_pick)
+            if anytime_pick:
+                picks.append(anytime_pick)
+        else:
+            # RB / WR / TE: anytime TD only (rushing + receiving)
+            anytime_pick = build_td_pick(
+                anytime_series,
+                last_row,
+                td_type="anytime",
+                target_week=target_week,
+            )
+            if anytime_pick:
+                picks.append(anytime_pick)
 
     if not picks:
         return {
@@ -721,20 +773,23 @@ def ai_td_picks(
             "error": "No players had enough TD history to project.",
         }
 
-    def score(p: dict) -> float:
-        return float(p["td_projection"]) * (p["confidence"] / 100.0)
+    # Sort by confidence first, then by projected TDs
+    def sort_key(p: dict) -> tuple[float, float]:
+        conf = float(p.get("confidence", 0))
+        proj = float(p.get("td_projection", 0.0))
+        return (conf, proj)
 
-    picks_sorted = sorted(picks, key=score, reverse=True)
+    picks_sorted = sorted(picks, key=sort_key, reverse=True)
     top = picks_sorted[: max(1, int(limit))]
     top_clean = clean_nans(top)
 
     return {
         "ok": True,
         "week": target_week,
-        "position": position,
         "count": len(top_clean),
         "picks": top_clean,
     }
+
 
 
 # -----------------------
